@@ -23,8 +23,9 @@ Versions are git tags. Pin one, next to amqplib:
 }
 ```
 
-amqplib is a peer dependency: the project owns its version and the library uses that copy. npm refuses to install
-the library next to an amqplib outside the supported range (`^2.2.0`).
+amqplib is a peer dependency pinned to the one version the tests run against, and the library uses the project's
+copy. Any other amqplib version fails `npm install` and `npm ci` with `ERESOLVE`, even if the lock file was
+written with `--force` or `--legacy-peer-deps`.
 
 ## Use
 
@@ -79,5 +80,8 @@ CI runs the suite against RabbitMQ 3.13, 4.2 and 4.3, including a broker restart
 1. Bump `version` in `package.json` in the PR.
 2. After the squash merge, tag the merge commit on `master` with the same version (`git tag v1.2.3 && git push origin v1.2.3`).
 3. Projects move to the new tag in their own changes.
+
+To support a new amqplib version, change it in both `peerDependencies` and `devDependencies`, let CI run, and
+release. Projects then move amqplib and the tag together.
 
 Tags matching `v*` cannot be moved or deleted, so a version always points at the same code.

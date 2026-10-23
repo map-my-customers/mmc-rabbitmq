@@ -17,7 +17,7 @@
     "test": "node --test --test-concurrency=1 \"test/**/*.test.js\""
   },
   "peerDependencies": {
-    "amqplib": "^2.2.0"
+    "amqplib": "2.2.0"
   },
   "devDependencies": {
     "amqplib": "2.2.0"
