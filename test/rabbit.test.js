@@ -38,7 +38,9 @@ async function admin(fn) {
 }
 
 const depth = (queue) => admin(async (ch) => (await ch.checkQueue(queue)).messageCount);
-const rabbitmqctl = (args) => execSync(`docker exec -u rabbitmq ${CONTAINER} rabbitmqctl ${args}`, { stdio: 'ignore' });
+const exists = (queue) => admin((ch) => ch.checkQueue(queue)).then(() => true, () => false);
+const rabbitmqctl = (args) =>
+  execSync(`docker exec -u rabbitmq ${CONTAINER} rabbitmqctl ${args}`, { stdio: 'ignore', timeout: 60_000 });
 
 const quorum = (queue, args = {}) => (ch) =>
   ch.assertQueue(queue, { durable: true, arguments: { 'x-queue-type': 'quorum', ...args } });
@@ -74,11 +76,13 @@ test('delivers confirmed, persistent publishes, each with its own message id', a
   assert.ok(got.every((m) => UUID.test(m.properties.messageId) && m.properties.deliveryMode === 2));
 });
 
-test('holds publishes through a broker restart and keeps consuming', { timeout: 180_000 }, async (t) => {
+test('holds publishes through a broker restart, keeps consuming and declares again', { timeout: 180_000 }, async (t) => {
   const queue = queueName('restart');
+  const redeclared = queueName('redeclared');
   const mq = rabbit(t);
   const seen = new Map();
   mq.declare(quorum(queue));
+  mq.declare(quorum(redeclared));
   mq.consume(queue, async (msg) => {
     const i = JSON.parse(msg.content).i;
     seen.set(i, (seen.get(i) || 0) + 1);
@@ -89,6 +93,7 @@ test('holds publishes through a broker restart and keeps consuming', { timeout: 
   let i = 0;
   const timer = setInterval(() => sends.push(mq.sendToQueue(queue, { i: i++ })), 20);
   await sleep(1000);
+  await admin((ch) => ch.deleteQueue(redeclared));
   execSync(`docker stop ${CONTAINER}`, { stdio: 'ignore' });
   await sleep(5000);
   execSync(`docker start ${CONTAINER}`, { stdio: 'ignore' });
@@ -98,6 +103,7 @@ test('holds publishes through a broker restart and keeps consuming', { timeout: 
   const results = await Promise.allSettled(sends);
   assert.equal(results.filter((r) => r.status === 'rejected').length, 0);
   await until(() => seen.size === i, 60_000);
+  await until(() => exists(redeclared));
   await mq.close(2000);
   const duplicates = [...seen.values()].filter((n) => n > 1).length;
   assert.ok(duplicates <= 20, `${duplicates} of ${i} messages delivered more than once`);
@@ -167,9 +173,25 @@ test('retryLimit ends RetryLater retries with the onError outcome', async (t) =>
   assert.equal(calls, 3);
 });
 
+test('retryLimit.ms ends RetryLater retries once the next wait would pass it', async (t) => {
+  const queue = queueName('retry-ms');
+  const mq = rabbit(t);
+  const dlq = withDeadLetters(mq, queue);
+  let calls = 0;
+  mq.consume(queue, async () => {
+    calls++;
+    throw new RetryLater('still down');
+  }, { prefetch: 1, retryLimit: { ms: 500 } });
+  await mq.start();
+  await mq.sendToQueue(queue, 'x');
+  await until(async () => (await depth(dlq)) === 1);
+  await mq.close(2000);
+  assert.equal(calls, 2);
+});
+
 test('RetryLater stops when close() is called and the message goes back to the queue', async (t) => {
   const queue = queueName('retry-close');
-  const mq = rabbit(t, { retryDelay: { min: 200, max: 200 } });
+  const mq = rabbit(t, { retryDelay: { min: 5000, max: 5000 } });
   let calls = 0;
   mq.declare(quorum(queue));
   mq.consume(queue, async () => {
@@ -178,12 +200,34 @@ test('RetryLater stops when close() is called and the message goes back to the q
   }, { prefetch: 1 });
   await mq.start();
   await mq.sendToQueue(queue, 'x');
-  await until(() => calls >= 2);
-  await mq.close(2000);
-  const afterClose = calls;
-  await sleep(800);
-  assert.equal(calls, afterClose);
+  await until(() => calls === 1);
+  const begun = Date.now();
+  await mq.close(10_000);
+  assert.ok(Date.now() - begun < 2000, `close waited ${Date.now() - begun} ms for a RetryLater sleep`);
+  await sleep(500);
+  assert.equal(calls, 1);
   assert.equal(await depth(queue), 1);
+});
+
+test('handlers run at most prefetch at a time', async (t) => {
+  const queue = queueName('prefetch');
+  const mq = rabbit(t);
+  let running = 0;
+  let peak = 0;
+  let peakInFlight = 0;
+  mq.declare(quorum(queue));
+  mq.consume(queue, async () => {
+    peak = Math.max(peak, ++running);
+    await sleep(150);
+    peakInFlight = Math.max(peakInFlight, mq.stats().inFlight);
+    await sleep(150);
+    running--;
+  }, { prefetch: 3 });
+  await mq.start();
+  await Promise.all(Array.from({ length: 10 }, (_, i) => mq.sendToQueue(queue, { i })));
+  await until(async () => running === 0 && (await depth(queue)) === 0 && mq.stats().inFlight === 0);
+  assert.deepEqual([peak, peakInFlight, mq.stats().consumers, mq.stats().subscribed], [3, 3, 1, 1]);
+  await mq.close(2000);
 });
 
 test('close waits for in-flight handlers before acking', async (t) => {
@@ -240,10 +284,12 @@ test('a publish the broker refuses fails alone and the publishes around it get t
   const queue = queueName('bad-publish');
   const mq = rabbit(t);
   const seen = new Map();
+  const ids = new Map();
   mq.declare(quorum(queue));
   mq.consume(queue, async (msg) => {
     const i = JSON.parse(msg.content).i;
     seen.set(i, (seen.get(i) || 0) + 1);
+    ids.set(i, (ids.get(i) || new Set()).add(msg.properties.messageId));
   }, { prefetch: 50 });
   await mq.start();
   await mq.ready(10_000);
@@ -260,6 +306,119 @@ test('a publish the broker refuses fails alone and the publishes around it get t
   await mq.close(2000);
   assert.equal(seen.has(-1), false);
   assert.ok([...seen.values()].every((n) => n <= 2), 'a good publish was delivered more than twice');
+  assert.ok([...ids.values()].every((set) => set.size === 1), 'a re-sent publish got a new message id');
+});
+
+test('bad publishes after several reconnects do not stall the good ones', { timeout: 120_000 }, async (t) => {
+  const queue = queueName('bad-after-reconnects');
+  const mq = rabbit(t, { retryDelay: { min: 200, max: 30_000 } });
+  mq.declare(quorum(queue));
+  await mq.start();
+  await mq.ready(10_000);
+  for (let n = 0; n < 3; n++) {
+    rabbitmqctl('close_all_connections reconnect-test');
+    await sleep(500);
+    await mq.ready(30_000);
+  }
+  const begun = Date.now();
+  const bad = Array.from({ length: 4 }, () => mq.sendToQueue(queue, 'bad', { expiration: '-5' }));
+  const good = Array.from({ length: 20 }, (_, i) => mq.sendToQueue(queue, { i }));
+  await Promise.all(good);
+  assert.ok(Date.now() - begun < 8000, `good publishes took ${Date.now() - begun} ms`);
+  for (const p of bad) await assert.rejects(p, /PRECONDITION_FAILED|expiration/i);
+  await mq.close(2000);
+});
+
+test('a nacked publish during the bad-publish search does not block the rest', async (t) => {
+  const full = queueName('full');
+  const queue = queueName('after-nack');
+  const mq = rabbit(t);
+  mq.declare((ch) => ch.assertQueue(full, { durable: true, arguments: { 'x-max-length': 1, 'x-overflow': 'reject-publish' } }));
+  mq.declare(quorum(queue));
+  await mq.start();
+  await mq.ready(10_000);
+  await mq.sendToQueue(full, 'fills it');
+  const begun = Date.now();
+  const bad = mq.sendToQueue(queue, 'bad', { expiration: '-5' });
+  mq.sendToQueue(full, 'nacked until there is room');
+  const good = Array.from({ length: 20 }, (_, i) => mq.sendToQueue(queue, { i }));
+  await assert.rejects(bad, /PRECONDITION_FAILED|expiration/i);
+  await Promise.all(good);
+  assert.ok(Date.now() - begun < 8000, `good publishes took ${Date.now() - begun} ms`);
+  assert.equal(mq.stats().held, 1);
+  await mq.close(500);
+});
+
+test('a publish amqplib cannot encode fails alone', async (t) => {
+  const queue = queueName('unencodable');
+  const mq = rabbit(t);
+  mq.declare(quorum(queue));
+  await mq.start();
+  await mq.ready(10_000);
+  const before = mq.sendToQueue(queue, 'before');
+  const bad = mq.sendToQueue(queue, 'bad', { headers: { notEncodable: () => {} } });
+  const after = mq.sendToQueue(queue, 'after');
+  await assert.rejects(bad);
+  await Promise.all([before, after]);
+  await mq.close(2000);
+  assert.equal(await depth(queue), 2);
+});
+
+test('a burst larger than the socket buffer is sent in full', { timeout: 60_000 }, async (t) => {
+  const queue = queueName('burst');
+  const mq = rabbit(t);
+  mq.declare(quorum(queue));
+  await mq.start();
+  await mq.ready(10_000);
+  const body = Buffer.alloc(4096, 1);
+  await Promise.all(Array.from({ length: 3000 }, () => mq.sendToQueue(queue, body)));
+  assert.equal(mq.stats().held, 0);
+  await mq.close(2000);
+  assert.equal(await depth(queue), 3000);
+});
+
+test('a consumer timeout aborts the running handler before the message is redelivered', { timeout: 120_000 }, async (t) => {
+  const queue = queueName('consumer-timeout');
+  const mq = rabbit(t);
+  const signals = [];
+  let overlapped = false;
+  mq.declare(quorum(queue, { 'x-consumer-timeout': 1000 }));
+  mq.consume(queue, async (msg, { signal }) => {
+    if (signals.some((s) => !s.aborted)) overlapped = true;
+    signals.push(signal);
+    if (signals.length > 1) return;
+    await new Promise((resolve) => {
+      signal.addEventListener('abort', resolve);
+      setTimeout(resolve, 90_000);
+    });
+  }, { prefetch: 1 });
+  await mq.start();
+  await mq.sendToQueue(queue, 'x');
+  await until(() => signals.length >= 2, 100_000);
+  await mq.close(2000);
+  assert.equal(overlapped, false, 'the redelivery started while the first run was still live');
+});
+
+test('a broker cancel aborts the signal of in-flight handlers', async (t) => {
+  const queue = queueName('cancel-signal');
+  const mq = rabbit(t);
+  let started = false;
+  let aborted = false;
+  mq.declare(quorum(queue));
+  mq.consume(queue, async (msg, { signal }) => {
+    started = true;
+    await new Promise((resolve) => {
+      signal.addEventListener('abort', resolve);
+      setTimeout(resolve, 10_000);
+    });
+    aborted = signal.aborted;
+  }, { prefetch: 1 });
+  await mq.start();
+  await mq.sendToQueue(queue, 'x');
+  await until(() => started);
+  await admin((ch) => ch.deleteQueue(queue));
+  await until(() => aborted, 5000);
+  await mq.close(2000);
 });
 
 test('a broken subscription or publish does not replay other consumers’ messages', async (t) => {
@@ -318,17 +477,22 @@ test('a missing queue does not hold up the others, and its consumer subscribes o
   assert.deepEqual(got, ['first', 'second']);
 });
 
-test('failing declarations are retried without taking publishing or the process down', async (t) => {
+test('a failing declaration does not skip the others or take publishing down', async (t) => {
   const queue = queueName('declared');
+  const after = queueName('declared-after');
+  const late = queueName('declared-late');
   const mq = rabbit(t);
   mq.declare(quorum(queue));
   // RabbitMQ 4.x answers a transient non-exclusive queue by closing the connection; 3.13 accepts it.
   mq.declare((ch) => ch.assertQueue(queueName('transient'), { durable: false }));
   mq.declare((ch) => ch.assertQueue(queue, { durable: true, arguments: { 'x-queue-type': 'classic' } }));
+  mq.declare(quorum(after));
   await mq.start();
   await mq.ready(10_000);
   await mq.sendToQueue(queue, 'x');
-  await sleep(1000);
+  await until(() => exists(after), 10_000);
+  mq.declare(quorum(late));
+  await until(() => exists(late), 10_000);
   assert.equal(mq.isReady(), true);
   await mq.close(2000);
 });
@@ -424,7 +588,10 @@ test('without a broker: publish failures are rejected promises, never throws or 
     await assert.rejects(mq.sendToQueue('q', undefined), /a Buffer, a string or a JSON value/);
     mq.sendToQueue('q', 'x'.repeat(100));
     mq.sendToQueue('q', 'small');
+    mq.publishWithin(100, '', 'q', 'tiny');
+    await sleep(200);
     await mq.close(200);
+    mq.sendToQueue('q', 'after close');
     await sleep(50);
   } finally {
     process.off('unhandledRejection', record);
@@ -446,6 +613,10 @@ test('without a broker: start() and close() are idempotent, and close() stays wi
   assert.equal(mq.close(500), closing);
   await closing;
   assert.ok(Date.now() - begun < 700, `close took ${Date.now() - begun} ms`);
+  await assert.rejects(mq.sendToQueue('q', 'x'), /closed/);
+  const neverStarted = noBroker(t);
+  await neverStarted.close(100);
+  await assert.rejects(neverStarted.start(), /closed/);
   await sleep(50);
   assert.ok(timeouts() <= before, `${timeouts() - before} timers left running`);
 });

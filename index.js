@@ -51,9 +51,10 @@ function createRabbit({
   name,
   heartbeat = 60,
   maxHeldBytes = 512 * 2 ** 20,
-  retryDelay = { min: 1000, max: 30_000 },
+  retryDelay: delays,
   log = console,
 }) {
+  const retryDelay = { min: 1000, max: 30_000, ...delays };
   const declarations = [];
   const consumers = [];
   const pending = [];
@@ -74,6 +75,7 @@ function createRabbit({
   let redeclare = false;
   let draining = false;
   let refusing = false;
+  let timingOut = false;
   let heldBytes = 0;
   let suspects = 0;
   let declareConn = null;
@@ -155,6 +157,8 @@ function createRabbit({
   // Publishing
 
   function enqueue(exchange, routingKey, body, options) {
+    // Publishes during close() still go out with the drain; after it there is nothing left to send them.
+    if (stopped) return rejected(new Error('mmc-rabbitmq: closed'));
     let content, contentType;
     try {
       ({ content, contentType } = toContent(body));
@@ -213,17 +217,23 @@ function createRabbit({
       ok = ch.publish(job.exchange, job.routingKey, job.content, job.options, (err) => {
         if (job.done || job.ch !== ch) return;
         if (err) {
-          // A nack leaves the channel open: hold the message and retry. A closed channel is handled on 'close'.
+          // A nack leaves the channel open, so the message did not break it: hold it and retry. A closed channel
+          // is handled on 'close'.
           queueMicrotask(() => {
             if (job.done || job.ch !== ch) return;
             job.ch = null;
+            if (job.suspect) {
+              job.suspect = false;
+              suspects--;
+            }
             later(flush, retryDelay.min);
           });
           return;
         }
-        if (job.returned) return finish(job, new Error(`mmc-rabbitmq: unroutable, no queue bound for ${job.routingKey}`));
         pubDelay = retryDelay.min;
-        finish(job);
+        timingOut = false;
+        if (job.returned) finish(job, new Error(`mmc-rabbitmq: unroutable, no queue bound for ${job.routingKey}`));
+        else finish(job);
         if (job.suspect) flush();
       });
     } catch (err) {
@@ -279,62 +289,97 @@ function createRabbit({
     const sent = pending.filter((job) => job.ch === ch);
     sent.forEach((job) => (job.ch = null));
     const missing = failure?.code === 404 && /no exchange '([^']*)'/.exec(failure.message);
-    if (missing) sent.filter((job) => job.exchange === missing[1]).forEach((job) => finish(job, failure));
-    else if (failure && sent.length === 1) finish(sent[0], failure);
-    else if (failure) {
+    let found = !failure;
+    if (missing) {
+      sent.filter((job) => job.exchange === missing[1]).forEach((job) => finish(job, failure));
+      found = true;
+    } else if (failure && sent.length === 1) {
+      finish(sent[0], failure);
+      found = true;
+    } else if (failure) {
       for (const job of sent) {
         if (!job.suspect) suspects++;
         job.suspect = true;
       }
     }
-    reopenPublisher(model);
+    // Back off only while the cause is unknown; a lost connection or an identified bad publish reopens at once.
+    if (found) pubDelay = retryDelay.min;
+    reopenPublisher(model, !found);
   }
 
-  function reopenPublisher(model) {
+  function reopenPublisher(model, backoff = true) {
     const delay = pubDelay;
-    pubDelay = Math.min(pubDelay * 2, retryDelay.max);
+    if (backoff) pubDelay = Math.min(pubDelay * 2, retryDelay.max);
     later(() => openPublisher(model), delay);
   }
 
   // Topology. Declarations get their own short-lived connection: a declare the broker answers by closing the
   // connection must not take publishing or consuming down with it.
 
-  function runDeclarations() {
+  function runDeclarations(list = declarations) {
     if (closing) return;
     if (declaring) return void (redeclare = true);
-    if (!declarations.length) return markDeclared();
+    if (!list.length) return markDeclared();
     declaring = true;
     redeclare = false;
+    declareEach([...list]).then((failed) => {
+      declaring = false;
+      markDeclared();
+      if (failed.length) {
+        const delay = declareDelay;
+        declareDelay = Math.min(declareDelay * 2, retryDelay.max);
+        later(() => runDeclarations(failed), delay);
+      } else {
+        declareDelay = retryDelay.min;
+      }
+      if (redeclare) runDeclarations();
+    });
+  }
+
+  // Each declaration gets its own channel, so one failure does not skip the rest. A declaration the broker answers
+  // by closing the connection gets a fresh connection for the ones after it. Resolves to the declarations that failed.
+  async function declareEach(list) {
+    const failed = [];
     let conn = null;
-    amqp
-      .connect(withHeartbeat(url, heartbeat), { timeout: 10_000, clientProperties: { connection_name: `${name} (declare)` } })
-      .then(async (opened) => {
-        conn = declareConn = opened;
-        conn.on('error', () => {});
-        const ch = await conn.createChannel();
-        ch.on('error', () => {});
-        for (const fn of [...declarations]) await fn(ch);
-      })
-      .then(
-        () => {
-          declareDelay = retryDelay.min;
-          declaring = false;
-          markDeclared();
-          if (redeclare) runDeclarations();
-        },
-        (err) => {
+    try {
+      for (const [i, fn] of list.entries()) {
+        if (closing) return failed.concat(list.slice(i));
+        try {
+          if (!conn) conn = await openDeclareConnection();
+        } catch (err) {
           log.error(`mmc-rabbitmq: declaring topology failed: ${describe(err)}`);
-          declaring = false;
-          markDeclared();
-          const delay = declareDelay;
-          declareDelay = Math.min(declareDelay * 2, retryDelay.max);
-          later(runDeclarations, delay);
-        },
-      )
-      .finally(() => {
-        if (declareConn === conn) declareConn = null;
-        conn?.close().catch(() => {});
-      });
+          return failed.concat(list.slice(i));
+        }
+        try {
+          const ch = await conn.model.createChannel();
+          ch.on('error', () => {});
+          await fn(ch);
+          await quietClose(ch);
+        } catch (err) {
+          failed.push(fn);
+          log.error(`mmc-rabbitmq: declaration ${declarations.indexOf(fn) + 1} failed: ${describe(conn.error ?? err)}`);
+          if (conn.closed) conn = null;
+        }
+      }
+      return failed;
+    } finally {
+      if (conn && !conn.closed) conn.model.close().catch(() => {});
+    }
+  }
+
+  async function openDeclareConnection() {
+    const model = await amqp.connect(withHeartbeat(url, heartbeat), {
+      timeout: 10_000,
+      clientProperties: { connection_name: `${name} (declare)` },
+    });
+    const conn = { model, error: null, closed: false };
+    declareConn = model;
+    model.on('error', (err) => (conn.error = err));
+    model.on('close', () => {
+      conn.closed = true;
+      if (declareConn === model) declareConn = null;
+    });
+    return conn;
   }
 
   function markDeclared() {
@@ -402,9 +447,10 @@ function createRabbit({
 
   function onMessage(consumer, ch, signal, msg) {
     if (msg === null) {
+      // Close the channel so in-flight handlers see their signal abort before the broker redelivers their messages.
       log.warn(`mmc-rabbitmq: broker cancelled the subscription to ${consumer.queue}, resubscribing`);
       consumer.tag = null;
-      return retry(consumer);
+      return void quietClose(ch);
     }
     const work = handle(consumer, ch, signal, msg);
     inFlight.add(work);
@@ -458,6 +504,7 @@ function createRabbit({
   // Lifecycle
 
   function start() {
+    if (closing && !starting) return Promise.reject(new Error('mmc-rabbitmq: closed'));
     starting ??= Promise.resolve().then(() => {
       pub = connect('publish', (model) => {
         openPublisher(model);
@@ -530,8 +577,14 @@ function createRabbit({
     publishWithin(ms, exchange, routingKey, body, options) {
       const job = enqueue(exchange, routingKey, body, options);
       if (!job.id) return job.promise;
-      const timer = setTimeout(() => finish(job, new Error(`mmc-rabbitmq: no broker confirm within ${ms} ms`), true), ms);
-      return job.promise.finally(() => clearTimeout(timer));
+      const timer = setTimeout(() => {
+        if (!timingOut) log.warn(`mmc-rabbitmq: publishes are timing out, no broker confirm within ${ms} ms`);
+        timingOut = true;
+        finish(job, new Error(`mmc-rabbitmq: no broker confirm within ${ms} ms`), true);
+      }, ms);
+      const promise = job.promise.finally(() => clearTimeout(timer));
+      promise.catch(() => {});
+      return promise;
     },
     ready(ms) {
       if (isReady()) return Promise.resolve();
