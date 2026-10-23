@@ -1,6 +1,8 @@
-import type { Channel, ConfirmChannel, ConsumeMessage, Options } from 'amqplib';
+import type { Channel, ConsumeMessage, Options } from 'amqplib';
 
-export class RetryLater extends Error {}
+export class RetryLater extends Error {
+  constructor(message?: string, options?: { cause?: unknown });
+}
 
 export interface RabbitOptions {
   url: string | Options.Connect;
@@ -11,18 +13,41 @@ export interface RabbitOptions {
   log?: Pick<Console, 'info' | 'warn' | 'error'>;
 }
 
-type Body = Buffer | string | object;
+export interface ConsumeOptions {
+  prefetch: number;
+  onError?: 'reject' | 'requeue';
+  retryLimit?: { attempts?: number; ms?: number };
+}
+
+export interface Delivery {
+  /** Aborts when the channel that delivered the message closes; the broker will redeliver it. */
+  signal: AbortSignal;
+}
+
+type Body = Buffer | string | object | number | boolean | null;
 
 export interface Rabbit {
-  start(): Promise<unknown>;
+  start(): Promise<void>;
+  ready(timeoutMs: number): Promise<void>;
   close(graceMs?: number): Promise<void>;
-  declare(fn: (ch: ConfirmChannel) => Promise<unknown>): void;
-  consume(queue: string, handler: (msg: ConsumeMessage) => Promise<unknown> | unknown, options?: { prefetch?: number }): void;
+  declare(fn: (ch: Channel) => Promise<unknown>): void;
+  consume(
+    queue: string,
+    handler: (msg: ConsumeMessage, delivery: Delivery) => Promise<unknown> | unknown,
+    options: ConsumeOptions,
+  ): void;
   publish(exchange: string, routingKey: string, body: Body, options?: Options.Publish): Promise<void>;
   sendToQueue(queue: string, body: Body, options?: Options.Publish): Promise<void>;
   publishWithin(ms: number, exchange: string, routingKey: string, body: Body, options?: Options.Publish): Promise<void>;
   isReady(): boolean;
-  stats(): { held: number; heldBytes: number; inFlight: number };
+  stats(): {
+    held: number;
+    heldBytes: number;
+    inFlight: number;
+    blocked: boolean;
+    consumers: number;
+    subscribed: number;
+  };
 }
 
 export function createRabbit(options: RabbitOptions): Rabbit;
