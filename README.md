@@ -85,7 +85,8 @@ main();
 
 A handler receives the message and `{ signal }`. The signal aborts when the channel that delivered the message
 closes; the broker then redelivers it, possibly while the first run is still going. Check it before side effects
-that must not happen twice.
+that must not happen twice. When the broker cancels a subscription (the queue was deleted, or a consumer timeout on
+RabbitMQ 4.x), the library closes that consumer's channel, so the signal aborts, and subscribes again.
 
 `consume()` and `declare()` work before or after `start()`.
 
@@ -102,16 +103,23 @@ It never throws, and a rejection nobody handles does not crash the process; the 
 `publishWithin(ms, …)` rejects if the broker has not confirmed in time and stops holding the message. The message
 may still be delivered, so retrying after a rejection can duplicate it.
 
+Publishes made while `close()` is draining still go out; once `close()` has finished, publishing rejects.
+
 ### Status
 
-- `start()` returns once connecting has begun; the library keeps retrying in the background.
+- `start()` returns once connecting has begun; the library keeps retrying in the background. After `close()` it
+  rejects.
 - `ready(ms)` waits until publishes can be sent, or rejects after `ms`. Useful in scripts.
-- `isReady()` is true when a publish would be sent right now: connected, and the broker is not blocking publishers.
+- `isReady()` is true when a publish would be sent right now: the publish channel is open, the first round of
+  declarations has finished, and the broker is not blocking publishers.
 - `stats()` reports held publishes and bytes, in-flight handlers, whether publishing is blocked, and how many
   consumers are subscribed.
 
 Options: `heartbeat` (seconds, default 60), `maxHeldBytes`, `retryDelay` (`{ min, max }` in ms, default 1 s to
 30 s; used for reconnecting, re-subscribing and `RetryLater` backoff) and `log` (default `console`).
+
+Each instance holds one publish connection, one consume connection once it has a consumer, and a short-lived
+declare connection while declarations run (after each publish reconnect, and for a `declare()` after `start()`).
 
 ## Test
 
@@ -127,7 +135,8 @@ and 4.3, including a broker restart during traffic and a memory alarm.
 
 ## Release
 
-1. Bump `version` in `package.json` in the PR.
+1. Bump the version in the PR with `npm version --no-git-tag-version 1.2.3`, which updates `package.json` and both
+   places in `package-lock.json`.
 2. After the squash merge, tag the merge commit on `master` with the same version (`git tag v1.2.3 && git push origin v1.2.3`).
 3. Projects move to the new tag in their own changes.
 
