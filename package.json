@@ -1,0 +1,26 @@
+{
+  "name": "mmc-rabbitmq",
+  "version": "1.0.0",
+  "description": "RabbitMQ client built on amqplib",
+  "private": true,
+  "license": "UNLICENSED",
+  "main": "index.js",
+  "types": "index.d.ts",
+  "files": [
+    "index.js",
+    "index.d.ts"
+  ],
+  "engines": {
+    "node": ">=18"
+  },
+  "scripts": {
+    "test": "node --test --test-concurrency=1 \"test/**/*.test.js\""
+  },
+  "dependencies": {
+    "amqplib": "2.2.0"
+  },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/map-my-customers/mmc-rabbitmq.git"
+  }
+}
