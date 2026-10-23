@@ -14,13 +14,17 @@ What it adds to amqplib:
 
 ## Install
 
-Versions are git tags. Pin one:
+Versions are git tags. Pin one, next to amqplib:
 
 ```json
 "dependencies": {
+  "amqplib": "2.2.0",
   "mmc-rabbitmq": "github:map-my-customers/mmc-rabbitmq#v1.0.0"
 }
 ```
+
+amqplib is a peer dependency: the project owns its version and the library uses that copy. npm refuses to install
+the library next to an amqplib outside the supported range (`^2.2.0`).
 
 ## Use
 

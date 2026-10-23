@@ -16,7 +16,10 @@
   "scripts": {
     "test": "node --test --test-concurrency=1 \"test/**/*.test.js\""
   },
-  "dependencies": {
+  "peerDependencies": {
+    "amqplib": "^2.2.0"
+  },
+  "devDependencies": {
     "amqplib": "2.2.0"
   },
   "repository": {
