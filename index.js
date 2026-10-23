@@ -452,6 +452,8 @@ function createRabbit({
       consumer.tag = null;
       return void quietClose(ch);
     }
+    // Delivered after close() started but before the cancel landed: leave it for another consumer.
+    if (closing) return settle(ch, msg, 'requeue');
     const work = handle(consumer, ch, signal, msg);
     inFlight.add(work);
     work.finally(() => inFlight.delete(work)).catch(() => {});
@@ -527,11 +529,13 @@ function createRabbit({
     const deadline = end - Math.min(2000, graceMs / 4);
     const left = () => Math.max(0, deadline - Date.now());
     const leftToEnd = () => Math.max(0, end - Date.now());
-    wakers.forEach((wake) => wake());
+    // Cancel before waking RetryLater sleeps: a woken handler requeues its message, and the broker must not hand it
+    // straight back to this consumer.
     const cancels = consumers
       .filter((c) => c.ch && c.tag)
       .map((c) => Promise.resolve().then(() => c.ch.cancel(c.tag)));
     await within(Promise.allSettled(cancels), left());
+    wakers.forEach((wake) => wake());
     await within(Promise.allSettled([...inFlight]), left());
     if (pending.length) await within(new Promise((resolve) => idleWaiters.push(resolve)), left());
     if (pending.length) log.error(`mmc-rabbitmq: ${pending.length} publishes unconfirmed at shutdown`);
