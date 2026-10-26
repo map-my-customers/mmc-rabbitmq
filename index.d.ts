@@ -43,6 +43,7 @@ export interface Rabbit {
   isReady(): boolean;
   stats(): {
     held: number;
+    /** Body bytes only; the hold cap also counts 1536 bytes per held publish. */
     heldBytes: number;
     inFlight: number;
     blocked: boolean;

@@ -790,9 +790,20 @@ test('a large held backlog drains without stalling the event loop, at most 256 u
   await Promise.all(sends);
   lag.disable();
   assert.ok(watched.maxUnconfirmed <= 256, `${watched.maxUnconfirmed} publishes unconfirmed at once`);
-  assert.ok(lag.max / 1e6 < 1000, `the event loop stalled for ${Math.round(lag.max / 1e6)} ms`);
+  assert.ok(lag.max / 1e6 < 250, `the event loop stalled for ${Math.round(lag.max / 1e6)} ms`);
   await mq.close(2000);
   assert.equal(await depth(queue), count);
+});
+
+test('without a broker: close() releases a large backlog promptly', async (t) => {
+  const mq = noBroker(t, { maxHeldBytes: 2 ** 30 });
+  await mq.start();
+  let released = 0;
+  for (let i = 0; i < 100_000; i++) mq.sendToQueue('q', 'x').catch(() => released++);
+  const begun = Date.now();
+  await mq.close(500);
+  assert.ok(Date.now() - begun < 2000, `close(500) took ${Date.now() - begun} ms to release 100000 held publishes`);
+  assert.equal(released, 100_000);
 });
 
 test('close() requeues a message whose handler is still waiting for its publish to be confirmed', async (t) => {
@@ -820,20 +831,41 @@ test('close() requeues a message whose handler is still waiting for its publish 
   assert.equal(await depth(dlq), 0);
 });
 
+// Holds back each basic.consume on `queue`, so a subscription stays half done while the library's timers fire.
+async function slowConsume(t, queue, ms) {
+  const proto = await admin((ch) => Object.getPrototypeOf(Object.getPrototypeOf(ch)));
+  const original = proto.consume;
+  const calls = new Map();
+  proto.consume = async function (name, ...rest) {
+    if (name !== queue) return original.call(this, name, ...rest);
+    calls.set(this, (calls.get(this) ?? 0) + 1);
+    await sleep(ms);
+    return original.call(this, name, ...rest);
+  };
+  t.after(() => (proto.consume = original));
+  return calls;
+}
+
 test('a dropped consume connection comes back with one subscription per consumer', { timeout: 120_000 }, async (t) => {
   const queue = queueName(t, 'one-subscription');
   const mq = rabbit(t);
   mq.declare(quorum(queue));
+  const calls = await slowConsume(t, queue, 5000);
+  const sent = () => [...calls.values()].reduce((a, b) => a + b, 0);
   mq.consume(queue, async () => {}, { prefetch: 1 });
   await mq.start();
-  await until(async () => (await consumerCount(queue).catch(() => 0)) === 1, 10_000);
-  for (let n = 0; n < 5; n++) {
+  await until(async () => (await consumerCount(queue).catch(() => 0)) === 1, 15_000);
+  // Each drop doubles the retry delay, and the last timer (800 ms) fires while the re-subscribe waits for consume-ok.
+  // The waits let each timer fire before the next drop: rabbitmqctl blocks the event loop.
+  for (let drop = 1; drop <= 3; drop++) {
     rabbitmqctl('close_all_connections subscription-test');
-    await until(async () => (await consumerCount(queue).catch(() => 0)) >= 1, 30_000);
-    // Longer than any retry timer left over from the drop.
-    await sleep(2500);
-    assert.equal(await consumerCount(queue), 1, `round ${n + 1}`);
+    await until(() => sent() > drop, 10_000);
+    if (drop < 3) await sleep(1000);
   }
+  await until(async () => (await consumerCount(queue).catch(() => 0)) >= 1, 30_000);
+  await sleep(2500);
+  assert.equal(await consumerCount(queue), 1);
+  assert.ok([...calls.values()].every((n) => n === 1), 'a channel was subscribed twice');
   await mq.close(2000);
 });
 
@@ -878,9 +910,13 @@ test('without a broker: ready() and start() reject once close() has started, and
   const before = timeouts();
   const mq = noBroker(t);
   await mq.start();
+  mq.sendToQueue('q', 'held').catch(() => {});
   const waiting = mq.ready(60_000);
-  await mq.close(200);
+  const begun = Date.now();
+  const closing = mq.close(2000);
   await assert.rejects(waiting, /closed/);
+  assert.ok(Date.now() - begun < 500, `ready() rejected ${Date.now() - begun} ms after close() started`);
+  await closing;
   await assert.rejects(mq.ready(60_000), /closed/);
   await assert.rejects(mq.start(), /closed/);
   await sleep(50);
@@ -982,4 +1018,30 @@ test('a handler that publishes after close() has finished puts its message back'
   assert.deepEqual(errors.filter((line) => line.includes('handler failed')), []);
   await until(async () => (await depth(queue)) === 1, 5000);
   assert.equal(await depth(dlq), 0);
+});
+
+test('a declaration round still connecting when close() finishes declares nothing', async (t) => {
+  const mq = rabbit(t);
+  let runs = 0;
+  mq.declare(async () => runs++);
+  await mq.start();
+  await mq.ready(10_000);
+  // Slows the declare connection of the round the drop starts, so close() finishes while it is still connecting.
+  const original = amqplib.connect;
+  let connecting;
+  const started = new Promise((resolve) => (connecting = resolve));
+  amqplib.connect = async function (url, options) {
+    if (/\(declare\)$/.test(options?.clientProperties?.connection_name)) {
+      connecting();
+      await sleep(400);
+    }
+    return original.call(this, url, options);
+  };
+  t.after(() => (amqplib.connect = original));
+  rabbitmqctl('close_all_connections declare-after-close');
+  await started;
+  await mq.close(1000);
+  const atClose = runs;
+  await sleep(1000);
+  assert.equal(runs, atClose, 'a declaration ran after close() returned');
 });

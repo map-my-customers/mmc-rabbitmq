@@ -83,6 +83,8 @@ function createRabbit({
   // nack; `suspects` were on a channel the broker closed over one of them, and are re-sent one at a time.
   const pending = new Map();
   let unsent = new Set();
+  // Where flush() stopped. A fresh iterator would walk every entry deleted since the Set last rehashed.
+  let cursor = null;
   const suspects = new Set();
   const inFlight = new Set();
   const timers = new Set();
@@ -247,8 +249,14 @@ function createRabbit({
       if (!ch.flying.size) send(ch, suspect);
       return;
     }
-    for (const job of unsent) {
-      if (ch.flying.size >= MAX_IN_FLIGHT || !send(ch, job)) return;
+    const it = (cursor ??= unsent.values());
+    while (ch.flying.size < MAX_IN_FLIGHT) {
+      const { value: job, done } = it.next();
+      if (done) {
+        if (cursor === it) cursor = null;
+        return;
+      }
+      if (!send(ch, job)) return;
     }
   }
 
@@ -366,6 +374,7 @@ function createRabbit({
       suspects.clear();
     }
     unsent = new Set([...sent.filter((job) => !job.done && !suspects.has(job)), ...unsent]);
+    cursor = null;
     // Back off only while the cause is unknown.
     const known = !failure || identified;
     if (known) pubDelay = retryDelay.min;
@@ -611,6 +620,8 @@ function createRabbit({
   }
 
   async function shutdown(graceMs) {
+    readyWaiters.forEach((waiter) => waiter.fail());
+    readyWaiters.clear();
     // Keep the end of the grace period for closing channels and connections, so close() stays within graceMs.
     const end = Date.now() + graceMs;
     const deadline = end - Math.min(2000, graceMs / 4);
@@ -631,8 +642,6 @@ function createRabbit({
     stopped = true;
     timers.forEach(clearTimeout);
     timers.clear();
-    readyWaiters.forEach((waiter) => waiter.fail());
-    readyWaiters.clear();
     declareConn?.close().catch(() => {});
     // Close channels first: a connection close can overtake acks still queued on a channel.
     const channels = [pubCh, ...consumers.map((c) => c.ch)].filter(Boolean);

@@ -113,7 +113,8 @@ waiting longer each time, up to the `retryDelay` maximum. Use `publishWithin` to
 At most 256 publishes wait for a confirm at once; the rest are sent, in order, as confirms come back.
 
 `maxHeldBytes` (64 MiB by default) caps the memory held for unconfirmed publishes. Each held publish counts as its
-body plus 1.5 KiB for its bookkeeping, so at the default about 40,000 small messages fit. Set it below the memory the
+body plus 1.5 KiB for its bookkeeping, so at the default about 40,000 small messages fit. `stats().heldBytes` counts
+bodies only, so the cap is reached when `heldBytes + 1536 × held` reaches `maxHeldBytes`. Set it below the memory the
 process has to spare, or an outage long enough to fill it can get the process killed and lose what it held. Once
 the cap is reached, new publishes reject with `RetryLater`, so a handler that awaits one retries its message in
 place instead of failing it. The handler runs again from the start, so work it did before the publish runs again:
@@ -138,8 +139,8 @@ until its time limit, so publishes held through the outage still go out if the b
   that connection have finished, and the broker is not blocking publishers. After a reconnect it stays false until
   the declarations run again, in case the topology did not survive the broker. That is usually milliseconds; each
   declaration the broker does not answer holds it for up to 10 s.
-- `stats()` reports held publishes and bytes, in-flight handlers, whether publishing is blocked, and how many
-  consumers are subscribed.
+- `stats()` reports held publishes and their body bytes, in-flight handlers, whether publishing is blocked, and how
+  many consumers are subscribed.
 
 Options: `heartbeat` (whole seconds from 0 to 65535, default 60), `maxHeldBytes` (default 64 MiB), `retryDelay` (`{ min, max }` in ms, default 1 s to
 30 s; used for reconnecting, re-subscribing and `RetryLater` backoff) and `log` (default `console`). `createRabbit`
