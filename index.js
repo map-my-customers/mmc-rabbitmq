@@ -64,7 +64,7 @@ function createRabbit({
   }
   const { min, max } = retryDelay;
   if (!(Number.isFinite(min) && Number.isFinite(max) && min > 0 && min <= max)) {
-    throw new TypeError(`mmc-rabbitmq: retryDelay needs 0 < min <= max, got ${JSON.stringify(delays)}`);
+    throw new TypeError(`mmc-rabbitmq: retryDelay needs 0 < min <= max, got min=${min} max=${max}`);
   }
   const declarations = [];
   const consumers = [];
