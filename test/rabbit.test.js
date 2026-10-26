@@ -605,6 +605,18 @@ test('without a broker: refuses past the hold limit with RetryLater and shuts do
   assert.equal(mq.stats().heldBytes, 0);
 });
 
+test('without a broker: the hold cap defaults to 64 MiB', { timeout: 5000 }, async (t) => {
+  const mq = noBroker(t);
+  await mq.start();
+  await assert.rejects(
+    mq.sendToQueue('q', Buffer.alloc(64 * 2 ** 20 + 1)),
+    (err) => !(err instanceof RetryLater) && /larger than maxHeldBytes/.test(err.message),
+  );
+  mq.sendToQueue('q', Buffer.alloc(64 * 2 ** 20)).catch(() => {});
+  assert.equal(mq.stats().heldBytes, 64 * 2 ** 20);
+  await mq.close(200);
+});
+
 test('without a broker: publishWithin rejects at its deadline and holds nothing', async (t) => {
   const mq = noBroker(t);
   await mq.start();
