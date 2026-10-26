@@ -605,6 +605,20 @@ test('without a broker: refuses past the hold limit with RetryLater and shuts do
   assert.equal(mq.stats().heldBytes, 0);
 });
 
+test('createRabbit rejects options that would disable the hold cap or spin its timers', () => {
+  const make = (options) => createRabbit({ url: NO_BROKER, name: 'options', log: quiet, ...options });
+  for (const maxHeldBytes of [NaN, 0, -1, Infinity, null, '512Mi']) {
+    assert.throws(() => make({ maxHeldBytes }), /maxHeldBytes must be a positive number/);
+  }
+  for (const heartbeat of [NaN, -1, null]) {
+    assert.throws(() => make({ heartbeat }), /heartbeat must be 0 or more/);
+  }
+  for (const retryDelay of [{ min: NaN }, { max: NaN }, { min: 0 }, { min: 5000, max: 1000 }, { min: null }]) {
+    assert.throws(() => make({ retryDelay }), /retryDelay needs 0 < min <= max/);
+  }
+  assert.doesNotThrow(() => make({ heartbeat: 0, retryDelay: { min: 1, max: 1 } }));
+});
+
 test('without a broker: the hold cap defaults to 64 MiB', { timeout: 5000 }, async (t) => {
   const mq = noBroker(t);
   await mq.start();

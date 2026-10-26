@@ -123,7 +123,8 @@ Publishes made while `close()` is draining still go out; once `close()` has fini
   consumers are subscribed.
 
 Options: `heartbeat` (seconds, default 60), `maxHeldBytes` (default 64 MiB), `retryDelay` (`{ min, max }` in ms, default 1 s to
-30 s; used for reconnecting, re-subscribing and `RetryLater` backoff) and `log` (default `console`).
+30 s; used for reconnecting, re-subscribing and `RetryLater` backoff) and `log` (default `console`). `createRabbit`
+throws a `TypeError` for a value that is not a number in range, such as an unparsed environment variable.
 
 Each instance holds one publish connection, one consume connection once it has a consumer, and a short-lived
 declare connection while declarations run (after each publish reconnect, and for a `declare()` after `start()`).

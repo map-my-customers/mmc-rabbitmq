@@ -55,6 +55,17 @@ function createRabbit({
   log = console,
 }) {
   const retryDelay = { min: 1000, max: 30_000, ...delays };
+  // A NaN would pass every comparison it is in as false: no hold cap, or timers that fire at once.
+  if (!(Number.isFinite(maxHeldBytes) && maxHeldBytes > 0)) {
+    throw new TypeError(`mmc-rabbitmq: maxHeldBytes must be a positive number, got ${maxHeldBytes}`);
+  }
+  if (!(Number.isFinite(heartbeat) && heartbeat >= 0)) {
+    throw new TypeError(`mmc-rabbitmq: heartbeat must be 0 or more seconds, got ${heartbeat}`);
+  }
+  const { min, max } = retryDelay;
+  if (!(Number.isFinite(min) && Number.isFinite(max) && min > 0 && min <= max)) {
+    throw new TypeError(`mmc-rabbitmq: retryDelay needs 0 < min <= max, got ${JSON.stringify(delays)}`);
+  }
   const declarations = [];
   const consumers = [];
   const pending = [];
