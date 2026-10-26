@@ -17,6 +17,8 @@ const MAX_IN_FLIGHT = 256;
 // Heap a held publish costs besides its body (job, options, headers, promise), measured on Node 24.
 const JOB_OVERHEAD = 1536;
 const MAX_TIMEOUT = 2 ** 31 - 1;
+// How long one declaration, or opening the declare connection, may take before it counts as failed.
+const DECLARE_TIMEOUT = 10_000;
 const ON_ERROR = {
   reject: 'rejected (dead-lettered if the queue has a dead-letter exchange, otherwise dropped)',
   requeue: 'requeued',
@@ -95,8 +97,8 @@ function createRabbit({
   let pubDelay = retryDelay.min;
   let declareDelay = retryDelay.min;
   let declared = false;
-  // The publish connection whose declarations have finished. Publishes wait for it after a reconnect, in case the
-  // topology did not survive the broker; readiness only waits for the first round.
+  // The publish connection whose declarations have finished. Publishes and readiness wait for it after a reconnect,
+  // in case the topology did not survive the broker.
   let declaredOn = null;
   let declaring = false;
   let redeclare = false;
@@ -133,7 +135,7 @@ function createRabbit({
   }
 
   function isReady() {
-    return pubCh !== null && declared && !pub.blocked;
+    return pubCh !== null && declared && declaredOn === pub.model && !pub.blocked;
   }
 
   function checkReady() {
@@ -184,8 +186,9 @@ function createRabbit({
   // Publishing
 
   function enqueue(exchange, routingKey, body, options) {
-    // Publishes during close() still go out with the drain; after it there is nothing left to send them.
-    if (stopped) return rejected(new Error('mmc-rabbitmq: closed'));
+    // Publishes during close() still go out with the drain; after it there is nothing left to send them. RetryLater,
+    // so a handler still running past close() puts its message back on the queue.
+    if (stopped) return rejected(new RetryLater('mmc-rabbitmq: closed'));
     let content, contentType;
     try {
       ({ content, contentType } = toContent(body));
@@ -413,15 +416,22 @@ function createRabbit({
           log.error(`mmc-rabbitmq: declaring topology failed: ${describe(err)}`);
           return failed.concat(list.slice(i));
         }
+        if (stopped) return failed.concat(list.slice(i));
+        const expired = new Error(`no answer within ${DECLARE_TIMEOUT} ms`);
+        let timer;
         try {
-          const ch = await conn.model.createChannel();
-          ch.on('error', () => {});
-          await fn(ch);
-          await quietClose(ch);
+          const timeout = new Promise((resolve, reject) => (timer = setTimeout(reject, DECLARE_TIMEOUT, expired)));
+          timers.add(timer);
+          await Promise.race([declareOne(conn.model, fn), timeout]);
         } catch (err) {
           failed.push(fn);
           log.error(`mmc-rabbitmq: declaration ${declarations.indexOf(fn) + 1} failed: ${describe(conn.error ?? err)}`);
-          if (conn.closed) conn = null;
+          // The broker may never answer on this connection; the next declaration gets a new one.
+          if (err === expired) conn.model.close().catch(() => {});
+          if (err === expired || conn.closed) conn = null;
+        } finally {
+          clearTimeout(timer);
+          timers.delete(timer);
         }
       }
       return failed;
@@ -430,9 +440,16 @@ function createRabbit({
     }
   }
 
+  async function declareOne(model, fn) {
+    const ch = await model.createChannel();
+    ch.on('error', () => {});
+    await fn(ch);
+    await quietClose(ch);
+  }
+
   async function openDeclareConnection() {
     const model = await amqp.connect(withHeartbeat(url, heartbeat), {
-      timeout: 10_000,
+      timeout: DECLARE_TIMEOUT,
       clientProperties: { connection_name: `${name} (declare)` },
     });
     const conn = { model, error: null, closed: false };
@@ -449,10 +466,11 @@ function createRabbit({
   function markDeclared(model) {
     if (model && model === pub.model) declaredOn = model;
     flush();
-    if (declared) return;
-    declared = true;
+    if (!declared) {
+      declared = true;
+      consumers.forEach(subscribe);
+    }
     checkReady();
-    consumers.forEach(subscribe);
   }
 
   // Consuming
@@ -492,8 +510,10 @@ function createRabbit({
         }
       })
       .catch((err) => {
+        // A channel lost to close() or a reconnect is expected; the reconnect subscribes again.
+        if (closing || sub.model !== model) return;
         log.warn(`mmc-rabbitmq: subscribing to ${consumer.queue} failed: ${describe(err)}`);
-        if (!closing && sub.model === model) retry(consumer);
+        retry(consumer);
       });
   }
 

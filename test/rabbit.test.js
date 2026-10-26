@@ -729,7 +729,7 @@ test('without a broker: start() and close() are idempotent, and close() stays wi
   assert.equal(mq.close(500), closing);
   await closing;
   assert.ok(Date.now() - begun < 700, `close took ${Date.now() - begun} ms`);
-  await assert.rejects(mq.sendToQueue('q', 'x'), /closed/);
+  await assert.rejects(mq.sendToQueue('q', 'x'), (err) => err instanceof RetryLater && /closed/.test(err.message));
   const neverStarted = noBroker(t);
   await neverStarted.close(100);
   await assert.rejects(neverStarted.start(), /closed/);
@@ -896,4 +896,90 @@ test('without a broker: publishWithin and ready reject a timeout setTimeout cann
   }
   assert.equal(mq.stats().held, 0);
   await mq.close(200);
+});
+
+test('after a reconnect, isReady() stays false until that connection’s declarations have run', { timeout: 60_000 }, async (t) => {
+  const queue = queueName(t, 'redeclare-ready');
+  const mq = rabbit(t);
+  let rounds = 0;
+  let gate = Promise.resolve();
+  mq.declare(async (ch) => {
+    rounds++;
+    await gate;
+    await quorum(queue)(ch);
+  });
+  await mq.start();
+  await mq.ready(10_000);
+  let open;
+  gate = new Promise((resolve) => (open = resolve));
+  rabbitmqctl('close_all_connections redeclare-test');
+  await until(() => rounds === 2, 10_000);
+  // Long enough for the publish channel to reopen.
+  await sleep(1000);
+  assert.equal(mq.isReady(), false);
+  const sent = mq.publish('', queue, 'x');
+  open();
+  await mq.ready(10_000);
+  await sent;
+  await mq.close(2000);
+  assert.equal(await depth(queue), 1);
+});
+
+test('a declaration the broker never answers fails after 10 s, and the next one gets a new connection', { timeout: 60_000 }, async (t) => {
+  const queue = queueName(t, 'declare-hang');
+  const before = timeouts();
+  const probe = await amqplib.connect(URL);
+  const proto = Object.getPrototypeOf(probe);
+  await probe.close();
+  // A connection that ran the hung declaration answers nothing more, like a broker that has gone quiet.
+  const stuck = new Set();
+  const createChannel = proto.createChannel;
+  proto.createChannel = function (...args) {
+    return stuck.has(this.connection) ? new Promise(() => {}) : createChannel.apply(this, args);
+  };
+  t.after(() => (proto.createChannel = createChannel));
+  const mq = rabbit(t);
+  let calls = 0;
+  mq.declare((ch) => {
+    calls++;
+    stuck.add(ch.connection);
+    return new Promise(() => {});
+  });
+  mq.declare(quorum(queue));
+  await mq.start();
+  await mq.ready(15_000);
+  await mq.publish('', queue, 'x');
+  // Its retry is waiting for an answer when close() runs.
+  await until(() => calls === 2, 5000);
+  await mq.close(2000);
+  assert.equal(await depth(queue), 1);
+  await sleep(50);
+  assert.ok(timeouts() <= before, `${timeouts() - before} timers left running`);
+});
+
+test('a handler that publishes after close() has finished puts its message back', async (t) => {
+  const queue = queueName(t, 'late-publish');
+  const errors = [];
+  const mq = rabbit(t, { log: { ...quiet, error: (line) => errors.push(line) } });
+  const dlq = withDeadLetters(t, mq, queue);
+  let release;
+  const closed = new Promise((resolve) => (release = resolve));
+  mq.consume(
+    queue,
+    async () => {
+      await closed;
+      await mq.publish('', queue, 'again');
+    },
+    { prefetch: 1 },
+  );
+  await mq.start();
+  await mq.ready(10_000);
+  await mq.publish('', queue, 'x');
+  await until(() => mq.stats().inFlight === 1, 10_000);
+  await mq.close(500);
+  release();
+  await sleep(200);
+  assert.deepEqual(errors.filter((line) => line.includes('handler failed')), []);
+  await until(async () => (await depth(queue)) === 1, 5000);
+  assert.equal(await depth(dlq), 0);
 });

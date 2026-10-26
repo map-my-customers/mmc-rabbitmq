@@ -15,7 +15,8 @@ What it adds to amqplib:
 - **Publishing and consuming use separate connections**, so a broker that blocks publishers (memory or disk alarm)
   does not stall consumers.
 - **Declarations run on their own short-lived connection** and are retried on failure, so a bad declaration
-  cannot take publishing or consuming down.
+  cannot take publishing or consuming down. A declaration with no answer from the broker within 10 s counts as
+  failed.
 - **`close()`** stops consuming, finishes in-flight work and waits for confirms, within its time limit.
 
 ## Install
@@ -122,11 +123,10 @@ message gets its `onError` outcome.
 `publishWithin(ms, …)` rejects if the broker has not confirmed in time and stops holding the message. The message
 may still be delivered, so retrying after a rejection can duplicate it.
 
-Publishes made while `close()` is draining still go out; once `close()` has finished, publishing rejects. A publish
-still unconfirmed when `close()` runs out of time rejects with `RetryLater`, so a handler awaiting it puts its message
-back on the queue instead of failing it. If the
-broker is down when `close()` starts, it keeps reconnecting until its time limit, so publishes held through the outage
-still go out if the broker returns in time.
+Publishes made while `close()` is draining still go out. A publish still unconfirmed when `close()` runs out of
+time, and any publish after `close()` has finished, rejects with `RetryLater`, so a handler awaiting it puts its
+message back on the queue instead of failing it. If the broker is down when `close()` starts, it keeps reconnecting
+until its time limit, so publishes held through the outage still go out if the broker returns in time.
 
 ### Status
 
@@ -134,9 +134,10 @@ still go out if the broker returns in time.
   rejects.
 - `ready(ms)` waits until publishes can be sent, or rejects after `ms`, or once `close()` has started. Useful in
   scripts.
-- `isReady()` is true when a publish would be sent right now: the publish channel is open, the first round of
-  declarations has finished, and the broker is not blocking publishers. After a reconnect, publishes also wait the
-  few milliseconds until that connection's declarations finish, in case the topology did not survive the broker.
+- `isReady()` is true when a publish would be sent right now: the publish channel is open, the declarations for
+  that connection have finished, and the broker is not blocking publishers. After a reconnect it stays false until
+  the declarations run again, in case the topology did not survive the broker. That is usually milliseconds; each
+  declaration the broker does not answer holds it for up to 10 s.
 - `stats()` reports held publishes and bytes, in-flight handlers, whether publishing is blocked, and how many
   consumers are subscribed.
 
@@ -144,7 +145,8 @@ Options: `heartbeat` (whole seconds from 0 to 65535, default 60), `maxHeldBytes`
 30 s; used for reconnecting, re-subscribing and `RetryLater` backoff) and `log` (default `console`). `createRabbit`
 throws a `TypeError` for a value that is not a number in range, such as an unparsed environment variable.
 `publishWithin(ms, …)` and `ready(ms)` reject with a `TypeError` unless `0 < ms <= 2147483647`. `close(graceMs)`
-takes at most that long; a missing or invalid value means 25 s.
+returns within about that long (a few milliseconds over when every step has to wait); a missing or invalid value
+means 25 s.
 
 Each instance holds one publish connection, one consume connection once it has a consumer, and a short-lived
 declare connection while declarations run (after each publish reconnect, and for a `declare()` after `start()`).
