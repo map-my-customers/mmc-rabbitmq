@@ -110,7 +110,9 @@ message gets its `onError` outcome.
 `publishWithin(ms, …)` rejects if the broker has not confirmed in time and stops holding the message. The message
 may still be delivered, so retrying after a rejection can duplicate it.
 
-Publishes made while `close()` is draining still go out; once `close()` has finished, publishing rejects.
+Publishes made while `close()` is draining still go out; once `close()` has finished, publishing rejects. If the
+broker is down when `close()` starts, it keeps reconnecting until its time limit, so publishes held through the outage
+still go out if the broker returns in time.
 
 ### Status
 

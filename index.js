@@ -266,13 +266,14 @@ function createRabbit({
     return ok;
   }
 
+  // Still opens while close() drains, so publishes held through an outage go out if the broker returns in time.
   function openPublisher(model) {
-    if (closing || pubOpening || pubCh || pub.model !== model) return;
+    if (stopped || pubOpening || pubCh || pub.model !== model) return;
     pubOpening = true;
     model.createConfirmChannel().then(
       (ch) => {
         pubOpening = false;
-        if (closing || pub.model !== model) return quietClose(ch);
+        if (stopped || pub.model !== model) return quietClose(ch);
         let failure = null;
         ch.on('error', (err) => {
           failure = err;
@@ -334,7 +335,7 @@ function createRabbit({
   // connection must not take publishing or consuming down with it.
 
   function runDeclarations(list = declarations) {
-    if (closing) return;
+    if (stopped) return;
     if (declaring) return void (redeclare = true);
     if (!list.length) return markDeclared();
     declaring = true;
@@ -360,7 +361,7 @@ function createRabbit({
     let conn = null;
     try {
       for (const [i, fn] of list.entries()) {
-        if (closing) return failed.concat(list.slice(i));
+        if (stopped) return failed.concat(list.slice(i));
         try {
           if (!conn) conn = await openDeclareConnection();
         } catch (err) {

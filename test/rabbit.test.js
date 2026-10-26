@@ -109,6 +109,21 @@ test('holds publishes through a broker restart, keeps consuming and declares aga
   assert.ok(duplicates <= 20, `${duplicates} of ${i} messages delivered more than once`);
 });
 
+test('close() sends publishes held through an outage once the broker is back within its grace', { timeout: 180_000 }, async (t) => {
+  const queue = queueName('close-after-outage');
+  const mq = rabbit(t);
+  mq.declare(quorum(queue));
+  await mq.start();
+  await mq.ready(10_000);
+  execSync(`docker stop ${CONTAINER}`, { stdio: 'ignore' });
+  const held = Array.from({ length: 50 }, (_, i) => mq.sendToQueue(queue, { i }));
+  execSync(`docker start ${CONTAINER}`, { stdio: 'ignore' });
+  await mq.close(90_000);
+  const results = await Promise.allSettled(held);
+  assert.equal(results.filter((r) => r.status === 'rejected').length, 0);
+  assert.equal(await depth(queue), 50);
+});
+
 test('RetryLater retries in place and acks once', async (t) => {
   const queue = queueName('retry');
   const mq = rabbit(t);
