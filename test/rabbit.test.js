@@ -815,7 +815,8 @@ test('close() requeues a message whose handler is still waiting for its publish 
   await mq.close(1000);
   // The broker state alone can't show it: the channel close usually overtakes a reject sent at the same moment.
   assert.deepEqual(errors.filter((line) => /handler failed/.test(line)), []);
-  assert.equal(await depth(queue), 1);
+  // A message returned by a closed channel can take a moment to show as ready.
+  await until(async () => (await depth(queue)) === 1, 5000);
   assert.equal(await depth(dlq), 0);
 });
 
