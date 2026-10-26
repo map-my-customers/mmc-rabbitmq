@@ -129,7 +129,7 @@ time, and any publish after `close()` has finished, rejects with `RetryLater`, s
 message back on the queue instead of failing it. If the broker is down when `close()` starts, it keeps reconnecting
 until its time limit, so publishes held through the outage still go out if the broker returns in time. `close()`
 does not wait for a declaration the broker has not answered: that connection closes in the background, and can keep
-a process that waits to exit on its own alive until the broker drops it.
+a process that waits to exit on its own alive until the broker drops it or the heartbeat times out.
 
 ### Status
 
