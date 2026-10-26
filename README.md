@@ -127,7 +127,9 @@ may still be delivered, so retrying after a rejection can duplicate it.
 Publishes made while `close()` is draining still go out. A publish still unconfirmed when `close()` runs out of
 time, and any publish after `close()` has finished, rejects with `RetryLater`, so a handler awaiting it puts its
 message back on the queue instead of failing it. If the broker is down when `close()` starts, it keeps reconnecting
-until its time limit, so publishes held through the outage still go out if the broker returns in time.
+until its time limit, so publishes held through the outage still go out if the broker returns in time. `close()`
+does not wait for a declaration the broker has not answered: that connection closes in the background, and can keep
+a process that waits to exit on its own alive until the broker drops it.
 
 ### Status
 

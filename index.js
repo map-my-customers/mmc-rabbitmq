@@ -423,7 +423,7 @@ function createRabbit({
         try {
           if (!conn) conn = await openDeclareConnection();
         } catch (err) {
-          log.error(`mmc-rabbitmq: declaring topology failed: ${describe(err)}`);
+          if (!stopped) log.error(`mmc-rabbitmq: declaring topology failed: ${describe(err)}`);
           return failed.concat(list.slice(i));
         }
         if (stopped) return failed.concat(list.slice(i));
@@ -435,7 +435,7 @@ function createRabbit({
           await Promise.race([declareOne(conn.model, fn), timeout]);
         } catch (err) {
           failed.push(fn);
-          log.error(`mmc-rabbitmq: declaration ${declarations.indexOf(fn) + 1} failed: ${describe(conn.error ?? err)}`);
+          if (!stopped) log.error(`mmc-rabbitmq: declaration ${declarations.indexOf(fn) + 1} failed: ${describe(conn.error ?? err)}`);
           // The broker may never answer on this connection; the next declaration gets a new one.
           if (err === expired) conn.model.close().catch(() => {});
           if (err === expired || conn.closed) conn = null;

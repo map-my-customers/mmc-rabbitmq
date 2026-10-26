@@ -884,10 +884,11 @@ test('a failed declaration is retried until it succeeds', async (t) => {
   assert.equal(await depth(queue), 1);
 });
 
-test('close() clears the library retry timers, and a round still running starts none', async (t) => {
+test('close() clears the library retry timers, and a round still running starts none and logs nothing', async (t) => {
   const queue = queueName(t, 'timers');
   const before = timeouts();
-  const mq = rabbit(t, { retryDelay: { min: 5000, max: 5000 } });
+  const errors = [];
+  const mq = rabbit(t, { retryDelay: { min: 5000, max: 5000 }, log: { ...quiet, error: (line) => errors.push(line) } });
   mq.declare(quorum(queue));
   // Fails every time, so a declaration retry is pending when close() runs.
   mq.declare((ch) => ch.assertQueue(queue, { durable: true, arguments: { 'x-queue-type': 'classic' } }));
@@ -902,8 +903,10 @@ test('close() clears the library retry timers, and a round still running starts 
   });
   await running;
   await mq.close(1000);
+  const atClose = errors.length;
   await sleep(600);
   assert.ok(timeouts() <= before, `${timeouts() - before} timers left running`);
+  assert.deepEqual(errors.slice(atClose), []);
 });
 
 test('without a broker: ready() and start() reject once close() has started, and leave no timers', async (t) => {
