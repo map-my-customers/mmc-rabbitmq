@@ -97,8 +97,13 @@ Every publish is `persistent` and `mandatory` unless the options say otherwise, 
 to spot duplicates.
 
 A publish rejects when the broker refuses it, when no queue is bound (unroutable), when the exchange is missing,
-when the body is not a Buffer, string or JSON value, or when `maxHeldBytes` (512 MiB by default) is already held.
-It never throws, and a rejection nobody handles does not crash the process; the library logs it.
+when the body is not a Buffer, string or JSON value, or when it is larger than `maxHeldBytes`. It never throws, and
+a rejection nobody handles does not crash the process; the library logs it.
+
+`maxHeldBytes` (64 MiB by default) caps the memory held for unconfirmed publishes. Set it below the memory the
+process has to spare, or an outage long enough to fill it can get the process killed and lose what it held. Once
+the cap is reached, new publishes reject with `RetryLater`, so a handler that awaits one retries its message in
+place instead of failing it.
 
 `publishWithin(ms, …)` rejects if the broker has not confirmed in time and stops holding the message. The message
 may still be delivered, so retrying after a rejection can duplicate it.
@@ -115,7 +120,7 @@ Publishes made while `close()` is draining still go out; once `close()` has fini
 - `stats()` reports held publishes and bytes, in-flight handlers, whether publishing is blocked, and how many
   consumers are subscribed.
 
-Options: `heartbeat` (seconds, default 60), `maxHeldBytes`, `retryDelay` (`{ min, max }` in ms, default 1 s to
+Options: `heartbeat` (seconds, default 60), `maxHeldBytes` (default 64 MiB), `retryDelay` (`{ min, max }` in ms, default 1 s to
 30 s; used for reconnecting, re-subscribing and `RetryLater` backoff) and `log` (default `console`).
 
 Each instance holds one publish connection, one consume connection once it has a consumer, and a short-lived

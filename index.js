@@ -50,7 +50,7 @@ function createRabbit({
   url,
   name,
   heartbeat = 60,
-  maxHeldBytes = 512 * 2 ** 20,
+  maxHeldBytes = 64 * 2 ** 20,
   retryDelay: delays,
   log = console,
 }) {
@@ -166,10 +166,16 @@ function createRabbit({
       log.error(`mmc-rabbitmq: publish to ${exchange || routingKey} failed: ${describe(err)}`);
       return rejected(err);
     }
+    if (content.length > maxHeldBytes) {
+      const err = new Error(`mmc-rabbitmq: a ${content.length}-byte message is larger than maxHeldBytes (${maxHeldBytes})`);
+      log.error(`mmc-rabbitmq: publish to ${exchange || routingKey} failed: ${describe(err)}`);
+      return rejected(err);
+    }
     if (heldBytes + content.length > maxHeldBytes) {
       if (!refusing) log.error(`mmc-rabbitmq: refusing publishes, ${heldBytes} bytes already held (limit ${maxHeldBytes})`);
       refusing = true;
-      return rejected(new Error('mmc-rabbitmq: hold limit reached'));
+      // A handler that awaits this publish retries its message in place instead of failing it.
+      return rejected(new RetryLater('mmc-rabbitmq: hold limit reached'));
     }
     refusing = false;
     const id = randomUUID();

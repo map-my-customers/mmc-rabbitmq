@@ -29,7 +29,7 @@ async function admin(fn) {
   const conn = await amqplib.connect(URL);
   conn.on('error', () => {});
   try {
-    const ch = await conn.createChannel();
+    const ch = await conn.createConfirmChannel();
     ch.on('error', () => {});
     return await fn(ch);
   } finally {
@@ -323,8 +323,12 @@ test('bad publishes after several reconnects do not stall the good ones', { time
   const begun = Date.now();
   const bad = Array.from({ length: 4 }, () => mq.sendToQueue(queue, 'bad', { expiration: '-5' }));
   const good = Array.from({ length: 20 }, (_, i) => mq.sendToQueue(queue, { i }));
+  // Reconnects must not have grown the reopen delay.
+  await assert.rejects(bad[0], /PRECONDITION_FAILED|expiration/i);
+  assert.ok(Date.now() - begun < 1000, `first bad publish found after ${Date.now() - begun} ms`);
+  // Each bad publish found must reset the delay, not double it.
   await Promise.all(good);
-  assert.ok(Date.now() - begun < 8000, `good publishes took ${Date.now() - begun} ms`);
+  assert.ok(Date.now() - begun < 3000, `good publishes took ${Date.now() - begun} ms`);
   for (const p of bad) await assert.rejects(p, /PRECONDITION_FAILED|expiration/i);
   await mq.close(2000);
 });
@@ -542,23 +546,55 @@ test('consumers keep consuming while the broker blocks publishing', { timeout: 6
   await mq.close(2000);
 });
 
+test('a handler whose publish hits the hold limit retries in place until there is room', async (t) => {
+  const full = queueName('hold-full');
+  const queue = queueName('hold-in');
+  const out = queueName('hold-out');
+  const mq = rabbit(t, { maxHeldBytes: 1000 });
+  mq.declare((ch) => ch.assertQueue(full, { durable: true, arguments: { 'x-max-length': 1, 'x-overflow': 'reject-publish' } }));
+  const dlq = withDeadLetters(mq, queue);
+  mq.declare(quorum(out));
+  let calls = 0;
+  mq.consume(queue, async () => {
+    calls++;
+    await mq.sendToQueue(out, 'forwarded');
+  }, { prefetch: 1 });
+  await mq.start();
+  await mq.ready(10_000);
+  await mq.sendToQueue(full, 'fills it');
+  const held = mq.sendToQueue(full, 'x'.repeat(1000));
+  assert.equal(mq.stats().heldBytes, 1000);
+  await admin((ch) => (ch.sendToQueue(queue, Buffer.from('in')), ch.waitForConfirms()));
+  await until(() => calls >= 3);
+  await admin((ch) => ch.purgeQueue(full));
+  await held;
+  await until(async () => (await depth(out)) === 1);
+  await mq.close(2000);
+  assert.equal(await depth(queue), 0);
+  assert.equal(await depth(dlq), 0);
+});
+
 test('consume() needs an explicit prefetch and a known onError', (t) => {
   const mq = noBroker(t);
   assert.throws(() => mq.consume('q', () => {}), /explicit prefetch/);
   assert.throws(() => mq.consume('q', () => {}, { prefetch: 1, onError: 'drop' }), /onError/);
 });
 
-test('without a broker: refuses past the hold limit and shuts down promptly', async (t) => {
+test('without a broker: refuses past the hold limit with RetryLater and shuts down promptly', async (t) => {
   const mq = noBroker(t, { maxHeldBytes: 5000 });
   await mq.start();
   let refused = 0;
   let closedUnconfirmed = 0;
   for (let i = 0; i < 10; i++) {
     mq.sendToQueue('q', 'y'.repeat(1000)).catch((err) => {
-      if (/hold limit/.test(err.message)) refused++;
+      if (err instanceof RetryLater && /hold limit/.test(err.message)) refused++;
       if (/closed before the broker confirmed/.test(err.message)) closedUnconfirmed++;
     });
   }
+  await assert.rejects(
+    mq.sendToQueue('q', 'z'.repeat(5001)),
+    (err) => !(err instanceof RetryLater) && /larger than maxHeldBytes/.test(err.message),
+  );
   await sleep(50);
   assert.equal(refused, 5);
   assert.deepEqual([mq.stats().held, mq.stats().heldBytes], [5, 5000]);

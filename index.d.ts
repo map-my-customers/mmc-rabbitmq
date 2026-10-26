@@ -8,6 +8,7 @@ export interface RabbitOptions {
   url: string | Options.Connect;
   name: string;
   heartbeat?: number;
+  /** Memory held for unconfirmed publishes; past it, publishes reject with RetryLater. Default 64 MiB. */
   maxHeldBytes?: number;
   retryDelay?: { min: number; max: number };
   log?: Pick<Console, 'info' | 'warn' | 'error'>;
