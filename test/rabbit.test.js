@@ -1045,3 +1045,26 @@ test('a declaration round still connecting when close() finishes declares nothin
   await sleep(1000);
   assert.equal(runs, atClose, 'a declaration ran after close() returned');
 });
+
+test('publishes made while amqplib closes the publish channel itself are held, not rejected', async (t) => {
+  const queue = queueName(t, 'closing');
+  const mq = rabbit(t);
+  mq.declare(quorum(queue));
+  await mq.start();
+  await mq.ready(10_000);
+  // The next publish to `queue` makes amqplib close its channel with an error, as it does on an unexpected frame.
+  const proto = await admin((ch) => Object.getPrototypeOf(ch));
+  const original = proto.publish;
+  let armed = true;
+  proto.publish = function (exchange, routingKey, ...rest) {
+    if (armed && routingKey === queue) {
+      armed = false;
+      this.closeWithError(0, 'closed by the test', 541, new Error('closed by the test'));
+    }
+    return original.call(this, exchange, routingKey, ...rest);
+  };
+  t.after(() => (proto.publish = original));
+  await Promise.all(Array.from({ length: 20 }, (_, i) => mq.sendToQueue(queue, String(i))));
+  await mq.close(2000);
+  assert.equal(await depth(queue), 20);
+});

@@ -265,7 +265,8 @@ function createRabbit({
     try {
       ok = ch.publish(job.exchange, job.routingKey, job.content, job.options, (err) => onConfirm(ch, job, err));
     } catch (err) {
-      if (pubCh !== ch || closedChannels.has(ch)) return false;
+      // amqplib throws IllegalOperationError while it closes the channel or connection; 'close' follows.
+      if (pubCh !== ch || closedChannels.has(ch) || err?.name === 'IllegalOperationError') return false;
       // The channel is fine, so the message itself is invalid. Finish it outside the loop that is sending.
       unsent.delete(job);
       queueMicrotask(() => {
