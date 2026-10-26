@@ -33,7 +33,9 @@ amqplib is a peer dependency pinned to the one version the tests run against, an
 copy. With npm's default settings, any other amqplib version fails `npm install` and `npm ci` with `ERESOLVE`.
 `npm ci` also fails on a lock file written with `--force` or `--legacy-peer-deps`.
 
-TypeScript projects need `@types/node`, as amqplib's own types do.
+TypeScript projects need `@types/node`, as amqplib's own types do. amqplib bundles its types since 1.2.0, so code
+that used an older amqplib untyped is now type-checked: for example, `connect()` returns a `ChannelModel`, not a
+`Connection`.
 
 ## Use
 
@@ -55,6 +57,12 @@ async function main() {
 
   await mq.start();
 
+  // Right after start(): a publish below can wait through an outage, and SIGTERM must still close.
+  process.on('SIGTERM', async () => {
+    await mq.close(25_000);
+    process.exit(0);
+  });
+
   // Fire and forget: the message is held until the broker confirms it. A failure is logged.
   mq.sendToQueue('example', { id: 1 });
 
@@ -63,14 +71,12 @@ async function main() {
 
   // Wait a bounded time, e.g. inside an HTTP handler that should answer quickly.
   await mq.publishWithin(8000, 'exchange', 'routing.key', { id: 3 });
-
-  process.on('SIGTERM', async () => {
-    await mq.close(25_000);
-    process.exit(0);
-  });
 }
 
-main();
+main().catch((err) => {
+  console.error(err);
+  process.exitCode = 1;
+});
 ```
 
 ### Consumers
@@ -79,9 +85,9 @@ main();
 
 | Option | Default | Meaning |
 |---|---|---|
-| `prefetch` | required | Unacked messages the broker sends at once. `0` means no limit. |
+| `prefetch` | required | Unacked messages the broker sends at once, up to 65535. `0` means no limit. |
 | `onError` | `'reject'` | What a handler error does. `'reject'` dead-letters the message if the queue has a dead-letter exchange and drops it otherwise. `'requeue'` puts it back; on a queue without a delivery limit, a message that always fails loops. |
-| `retryLimit` | none | `{ attempts, ms }`: when `RetryLater` has been thrown this many times, or for this long, the message gets the `onError` outcome. |
+| `retryLimit` | none | `{ attempts, ms }`: when `RetryLater` has been thrown this many times, or for this long, the message gets the `onError` outcome. Both are positive numbers. |
 
 A handler receives the message and `{ signal }`. The signal aborts when the channel that delivered the message
 closes; the broker then redelivers it, possibly while the first run is still going. Check it before side effects
@@ -100,7 +106,13 @@ A publish rejects when the broker refuses it, when no queue is bound (unroutable
 when the body is not a Buffer, string or JSON value, or when it is larger than `maxHeldBytes`. It never throws, and
 a rejection nobody handles does not crash the process; the library logs it.
 
-`maxHeldBytes` (64 MiB by default) caps the memory held for unconfirmed publishes. Set it below the memory the
+A publish the broker nacks (for example to a full `reject-publish` queue) does not reject: it is held and sent again,
+waiting longer each time, up to the `retryDelay` maximum. Use `publishWithin` to bound the wait.
+
+At most 256 publishes wait for a confirm at once; the rest are sent, in order, as confirms come back.
+
+`maxHeldBytes` (64 MiB by default) caps the memory held for unconfirmed publishes. Each held publish counts as its
+body plus 1.5 KiB for its bookkeeping, so at the default about 40,000 small messages fit. Set it below the memory the
 process has to spare, or an outage long enough to fill it can get the process killed and lose what it held. Once
 the cap is reached, new publishes reject with `RetryLater`, so a handler that awaits one retries its message in
 place instead of failing it. The handler runs again from the start, so work it did before the publish runs again:
@@ -110,7 +122,9 @@ message gets its `onError` outcome.
 `publishWithin(ms, …)` rejects if the broker has not confirmed in time and stops holding the message. The message
 may still be delivered, so retrying after a rejection can duplicate it.
 
-Publishes made while `close()` is draining still go out; once `close()` has finished, publishing rejects. If the
+Publishes made while `close()` is draining still go out; once `close()` has finished, publishing rejects. A publish
+still unconfirmed when `close()` runs out of time rejects with `RetryLater`, so a handler awaiting it puts its message
+back on the queue instead of failing it. If the
 broker is down when `close()` starts, it keeps reconnecting until its time limit, so publishes held through the outage
 still go out if the broker returns in time.
 
@@ -118,15 +132,19 @@ still go out if the broker returns in time.
 
 - `start()` returns once connecting has begun; the library keeps retrying in the background. After `close()` it
   rejects.
-- `ready(ms)` waits until publishes can be sent, or rejects after `ms`. Useful in scripts.
+- `ready(ms)` waits until publishes can be sent, or rejects after `ms`, or once `close()` has started. Useful in
+  scripts.
 - `isReady()` is true when a publish would be sent right now: the publish channel is open, the first round of
-  declarations has finished, and the broker is not blocking publishers.
+  declarations has finished, and the broker is not blocking publishers. After a reconnect, publishes also wait the
+  few milliseconds until that connection's declarations finish, in case the topology did not survive the broker.
 - `stats()` reports held publishes and bytes, in-flight handlers, whether publishing is blocked, and how many
   consumers are subscribed.
 
-Options: `heartbeat` (seconds, default 60), `maxHeldBytes` (default 64 MiB), `retryDelay` (`{ min, max }` in ms, default 1 s to
+Options: `heartbeat` (whole seconds from 0 to 65535, default 60), `maxHeldBytes` (default 64 MiB), `retryDelay` (`{ min, max }` in ms, default 1 s to
 30 s; used for reconnecting, re-subscribing and `RetryLater` backoff) and `log` (default `console`). `createRabbit`
 throws a `TypeError` for a value that is not a number in range, such as an unparsed environment variable.
+`publishWithin(ms, …)` and `ready(ms)` reject with a `TypeError` unless `0 < ms <= 2147483647`. `close(graceMs)`
+takes at most that long; a missing or invalid value means 25 s.
 
 Each instance holds one publish connection, one consume connection once it has a consumer, and a short-lived
 declare connection while declarations run (after each publish reconnect, and for a `declare()` after `start()`).

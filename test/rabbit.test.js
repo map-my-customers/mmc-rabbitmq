@@ -4,6 +4,7 @@
 const { test } = require('node:test');
 const assert = require('node:assert/strict');
 const { execSync } = require('node:child_process');
+const { monitorEventLoopDelay } = require('node:perf_hooks');
 const amqplib = require('amqplib');
 const { createRabbit, RetryLater } = require('..');
 
@@ -15,7 +16,6 @@ const quiet = { info() {}, warn() {}, error() {} };
 const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
 const timeouts = () => process.getActiveResourcesInfo().filter((r) => r === 'Timeout').length;
 let counter = 0;
-const queueName = (label) => `mmc-rabbitmq-test.${label}.${process.pid}.${++counter}`;
 
 async function until(check, ms = 30_000) {
   const end = Date.now() + ms;
@@ -37,7 +37,13 @@ async function admin(fn) {
   }
 }
 
+const queueName = (t, label) => {
+  const queue = `mmc-rabbitmq-test.${label}.${process.pid}.${++counter}`;
+  t.after(() => admin((ch) => ch.deleteQueue(queue)).catch(() => {}));
+  return queue;
+};
 const depth = (queue) => admin(async (ch) => (await ch.checkQueue(queue)).messageCount);
+const consumerCount = (queue) => admin(async (ch) => (await ch.checkQueue(queue)).consumerCount);
 const exists = (queue) => admin((ch) => ch.checkQueue(queue)).then(() => true, () => false);
 const rabbitmqctl = (args) =>
   execSync(`docker exec -u rabbitmq ${CONTAINER} rabbitmqctl ${args}`, { stdio: 'ignore', timeout: 60_000 });
@@ -45,8 +51,9 @@ const rabbitmqctl = (args) =>
 const quorum = (queue, args = {}) => (ch) =>
   ch.assertQueue(queue, { durable: true, arguments: { 'x-queue-type': 'quorum', ...args } });
 
-const withDeadLetters = (mq, queue) => {
+const withDeadLetters = (t, mq, queue) => {
   const dlq = `${queue}.dl`;
+  t.after(() => admin((ch) => ch.deleteQueue(dlq)).catch(() => {}));
   mq.declare(quorum(dlq));
   mq.declare(quorum(queue, { 'x-dead-letter-exchange': '', 'x-dead-letter-routing-key': dlq }));
   return dlq;
@@ -61,7 +68,7 @@ function rabbit(t, options = {}) {
 const noBroker = (t, options = {}) => rabbit(t, { url: NO_BROKER, name: 'no-broker', ...options });
 
 test('delivers confirmed, persistent publishes, each with its own message id', async (t) => {
-  const queue = queueName('roundtrip');
+  const queue = queueName(t, 'roundtrip');
   const mq = rabbit(t);
   const got = [];
   mq.declare(quorum(queue));
@@ -77,8 +84,8 @@ test('delivers confirmed, persistent publishes, each with its own message id', a
 });
 
 test('holds publishes through a broker restart, keeps consuming and declares again', { timeout: 180_000 }, async (t) => {
-  const queue = queueName('restart');
-  const redeclared = queueName('redeclared');
+  const queue = queueName(t, 'restart');
+  const redeclared = queueName(t, 'redeclared');
   const mq = rabbit(t);
   const seen = new Map();
   mq.declare(quorum(queue));
@@ -95,22 +102,24 @@ test('holds publishes through a broker restart, keeps consuming and declares aga
   await sleep(1000);
   await admin((ch) => ch.deleteQueue(redeclared));
   execSync(`docker stop ${CONTAINER}`, { stdio: 'ignore' });
+  // Held through the outage: it must wait for the queue's re-declaration, not go out as unroutable before it.
+  sends.push(mq.sendToQueue(redeclared, 'held'));
   await sleep(5000);
   execSync(`docker start ${CONTAINER}`, { stdio: 'ignore' });
   await mq.ready(90_000);
   await sleep(1000);
   clearInterval(timer);
   const results = await Promise.allSettled(sends);
-  assert.equal(results.filter((r) => r.status === 'rejected').length, 0);
+  assert.deepEqual(results.filter((r) => r.status === 'rejected').map((r) => r.reason.message), []);
   await until(() => seen.size === i, 60_000);
-  await until(() => exists(redeclared));
+  assert.equal(await depth(redeclared), 1);
   await mq.close(2000);
   const duplicates = [...seen.values()].filter((n) => n > 1).length;
   assert.ok(duplicates <= 20, `${duplicates} of ${i} messages delivered more than once`);
 });
 
 test('close() sends publishes held through an outage once the broker is back within its grace', { timeout: 180_000 }, async (t) => {
-  const queue = queueName('close-after-outage');
+  const queue = queueName(t, 'close-after-outage');
   const mq = rabbit(t);
   mq.declare(quorum(queue));
   await mq.start();
@@ -125,7 +134,7 @@ test('close() sends publishes held through an outage once the broker is back wit
 });
 
 test('RetryLater retries in place and acks once', async (t) => {
-  const queue = queueName('retry');
+  const queue = queueName(t, 'retry');
   const mq = rabbit(t);
   let calls = 0;
   mq.declare(quorum(queue));
@@ -141,9 +150,9 @@ test('RetryLater retries in place and acks once', async (t) => {
 });
 
 test('other handler errors, including non-Error throws, reject the message and the consumer carries on', async (t) => {
-  const queue = queueName('poison');
+  const queue = queueName(t, 'poison');
   const mq = rabbit(t);
-  const dlq = withDeadLetters(mq, queue);
+  const dlq = withDeadLetters(t, mq, queue);
   const good = [];
   mq.consume(queue, async (msg) => {
     const body = String(msg.content);
@@ -158,7 +167,7 @@ test('other handler errors, including non-Error throws, reject the message and t
 });
 
 test('onError: requeue puts a failed message back for another try', async (t) => {
-  const queue = queueName('requeue');
+  const queue = queueName(t, 'requeue');
   const mq = rabbit(t);
   let calls = 0;
   mq.declare(quorum(queue));
@@ -173,9 +182,9 @@ test('onError: requeue puts a failed message back for another try', async (t) =>
 });
 
 test('retryLimit ends RetryLater retries with the onError outcome', async (t) => {
-  const queue = queueName('retry-limit');
+  const queue = queueName(t, 'retry-limit');
   const mq = rabbit(t);
-  const dlq = withDeadLetters(mq, queue);
+  const dlq = withDeadLetters(t, mq, queue);
   let calls = 0;
   mq.consume(queue, async () => {
     calls++;
@@ -189,9 +198,9 @@ test('retryLimit ends RetryLater retries with the onError outcome', async (t) =>
 });
 
 test('retryLimit.ms ends RetryLater retries once the next wait would pass it', async (t) => {
-  const queue = queueName('retry-ms');
+  const queue = queueName(t, 'retry-ms');
   const mq = rabbit(t);
-  const dlq = withDeadLetters(mq, queue);
+  const dlq = withDeadLetters(t, mq, queue);
   let calls = 0;
   mq.consume(queue, async () => {
     calls++;
@@ -205,7 +214,7 @@ test('retryLimit.ms ends RetryLater retries once the next wait would pass it', a
 });
 
 test('RetryLater stops when close() is called and the message goes back to the queue', async (t) => {
-  const queue = queueName('retry-close');
+  const queue = queueName(t, 'retry-close');
   const mq = rabbit(t, { retryDelay: { min: 5000, max: 5000 } });
   let calls = 0;
   mq.declare(quorum(queue));
@@ -225,7 +234,7 @@ test('RetryLater stops when close() is called and the message goes back to the q
 });
 
 test('handlers run at most prefetch at a time', async (t) => {
-  const queue = queueName('prefetch');
+  const queue = queueName(t, 'prefetch');
   const mq = rabbit(t);
   let running = 0;
   let peak = 0;
@@ -246,7 +255,7 @@ test('handlers run at most prefetch at a time', async (t) => {
 });
 
 test('close waits for in-flight handlers before acking', async (t) => {
-  const queue = queueName('drain');
+  const queue = queueName(t, 'drain');
   const mq = rabbit(t);
   let started = false;
   let finished = false;
@@ -265,7 +274,7 @@ test('close waits for in-flight handlers before acking', async (t) => {
 });
 
 test('close waits for publishes the broker has not confirmed yet', async (t) => {
-  const queue = queueName('close-confirms');
+  const queue = queueName(t, 'close-confirms');
   const mq = rabbit(t);
   mq.declare(quorum(queue));
   await mq.start();
@@ -278,7 +287,7 @@ test('close waits for publishes the broker has not confirmed yet', async (t) => 
 });
 
 test('rejects a publish to a missing exchange and keeps publishing', async (t) => {
-  const queue = queueName('missing-exchange');
+  const queue = queueName(t, 'missing-exchange');
   const mq = rabbit(t);
   mq.declare(quorum(queue));
   await mq.start();
@@ -296,7 +305,7 @@ test('rejects an unroutable publish instead of dropping it silently', async (t) 
 });
 
 test('a publish the broker refuses fails alone and the publishes around it get through', async (t) => {
-  const queue = queueName('bad-publish');
+  const queue = queueName(t, 'bad-publish');
   const mq = rabbit(t);
   const seen = new Map();
   const ids = new Map();
@@ -325,7 +334,7 @@ test('a publish the broker refuses fails alone and the publishes around it get t
 });
 
 test('bad publishes after several reconnects do not stall the good ones', { timeout: 120_000 }, async (t) => {
-  const queue = queueName('bad-after-reconnects');
+  const queue = queueName(t, 'bad-after-reconnects');
   const mq = rabbit(t, { retryDelay: { min: 200, max: 30_000 } });
   mq.declare(quorum(queue));
   await mq.start();
@@ -349,8 +358,8 @@ test('bad publishes after several reconnects do not stall the good ones', { time
 });
 
 test('a nacked publish during the bad-publish search does not block the rest', async (t) => {
-  const full = queueName('full');
-  const queue = queueName('after-nack');
+  const full = queueName(t, 'full');
+  const queue = queueName(t, 'after-nack');
   const mq = rabbit(t);
   mq.declare((ch) => ch.assertQueue(full, { durable: true, arguments: { 'x-max-length': 1, 'x-overflow': 'reject-publish' } }));
   mq.declare(quorum(queue));
@@ -368,8 +377,24 @@ test('a nacked publish during the bad-publish search does not block the rest', a
   await mq.close(500);
 });
 
+test('once the refused publish is found, the rest go out together again', async (t) => {
+  const queue = queueName(t, 'after-found');
+  const mq = rabbit(t);
+  mq.declare(quorum(queue));
+  await mq.start();
+  await mq.ready(10_000);
+  const watched = await watchPublishes(t, queue);
+  const bad = mq.sendToQueue(queue, 'bad', { expiration: '-5' });
+  const good = Array.from({ length: 100 }, (_, i) => mq.sendToQueue(queue, { i }));
+  await assert.rejects(bad, /PRECONDITION_FAILED|expiration/i);
+  watched.maxUnconfirmed = watched.unconfirmed;
+  await Promise.all(good);
+  assert.ok(watched.maxUnconfirmed > 1, 'the publishes after the refused one were re-sent one at a time');
+  await mq.close(2000);
+});
+
 test('a publish amqplib cannot encode fails alone', async (t) => {
-  const queue = queueName('unencodable');
+  const queue = queueName(t, 'unencodable');
   const mq = rabbit(t);
   mq.declare(quorum(queue));
   await mq.start();
@@ -384,7 +409,7 @@ test('a publish amqplib cannot encode fails alone', async (t) => {
 });
 
 test('a burst larger than the socket buffer is sent in full', { timeout: 60_000 }, async (t) => {
-  const queue = queueName('burst');
+  const queue = queueName(t, 'burst');
   const mq = rabbit(t);
   mq.declare(quorum(queue));
   await mq.start();
@@ -397,7 +422,7 @@ test('a burst larger than the socket buffer is sent in full', { timeout: 60_000 
 });
 
 test('a consumer timeout aborts the running handler before the message is redelivered', { timeout: 120_000 }, async (t) => {
-  const queue = queueName('consumer-timeout');
+  const queue = queueName(t, 'consumer-timeout');
   const mq = rabbit(t);
   const signals = [];
   let overlapped = false;
@@ -407,8 +432,11 @@ test('a consumer timeout aborts the running handler before the message is redeli
     signals.push(signal);
     if (signals.length > 1) return;
     await new Promise((resolve) => {
-      signal.addEventListener('abort', resolve);
-      setTimeout(resolve, 90_000);
+      const timer = setTimeout(resolve, 90_000);
+      signal.addEventListener('abort', () => {
+        clearTimeout(timer);
+        resolve();
+      });
     });
   }, { prefetch: 1 });
   await mq.start();
@@ -419,7 +447,7 @@ test('a consumer timeout aborts the running handler before the message is redeli
 });
 
 test('a broker cancel aborts the signal of in-flight handlers', async (t) => {
-  const queue = queueName('cancel-signal');
+  const queue = queueName(t, 'cancel-signal');
   const mq = rabbit(t);
   let started = false;
   let aborted = false;
@@ -427,8 +455,11 @@ test('a broker cancel aborts the signal of in-flight handlers', async (t) => {
   mq.consume(queue, async (msg, { signal }) => {
     started = true;
     await new Promise((resolve) => {
-      signal.addEventListener('abort', resolve);
-      setTimeout(resolve, 10_000);
+      const timer = setTimeout(resolve, 10_000);
+      signal.addEventListener('abort', () => {
+        clearTimeout(timer);
+        resolve();
+      });
     });
     aborted = signal.aborted;
   }, { prefetch: 1 });
@@ -441,8 +472,8 @@ test('a broker cancel aborts the signal of in-flight handlers', async (t) => {
 });
 
 test('a broken subscription or publish does not replay other consumers’ messages', async (t) => {
-  const slow = queueName('isolated-slow');
-  const doomed = queueName('isolated-doomed');
+  const slow = queueName(t, 'isolated-slow');
+  const doomed = queueName(t, 'isolated-doomed');
   const mq = rabbit(t);
   let calls = 0;
   let done = 0;
@@ -471,8 +502,8 @@ test('a broken subscription or publish does not replay other consumers’ messag
 });
 
 test('a missing queue does not hold up the others, and its consumer subscribes once it exists', async (t) => {
-  const present = queueName('present');
-  const absent = queueName('absent');
+  const present = queueName(t, 'present');
+  const absent = queueName(t, 'absent');
   const mq = rabbit(t);
   const got = [];
   mq.declare(quorum(present));
@@ -497,13 +528,13 @@ test('a missing queue does not hold up the others, and its consumer subscribes o
 });
 
 test('a failing declaration does not skip the others or take publishing down', async (t) => {
-  const queue = queueName('declared');
-  const after = queueName('declared-after');
-  const late = queueName('declared-late');
+  const queue = queueName(t, 'declared');
+  const after = queueName(t, 'declared-after');
+  const late = queueName(t, 'declared-late');
   const mq = rabbit(t);
   mq.declare(quorum(queue));
   // RabbitMQ 4.x answers a transient non-exclusive queue by closing the connection; 3.13 accepts it.
-  mq.declare((ch) => ch.assertQueue(queueName('transient'), { durable: false }));
+  mq.declare((ch) => ch.assertQueue(queueName(t, 'transient'), { durable: false }));
   mq.declare((ch) => ch.assertQueue(queue, { durable: true, arguments: { 'x-queue-type': 'classic' } }));
   mq.declare(quorum(after));
   await mq.start();
@@ -517,7 +548,7 @@ test('a failing declaration does not skip the others or take publishing down', a
 });
 
 test('a publish the broker nacks is held and sent again until it is confirmed', async (t) => {
-  const queue = queueName('nack');
+  const queue = queueName(t, 'nack');
   const mq = rabbit(t);
   const got = [];
   mq.declare((ch) => ch.assertQueue(queue, { durable: true, arguments: { 'x-max-length': 1, 'x-overflow': 'reject-publish' } }));
@@ -537,7 +568,7 @@ test('a publish the broker nacks is held and sent again until it is confirmed', 
 });
 
 test('consumers keep consuming while the broker blocks publishing', { timeout: 60_000 }, async (t) => {
-  const queue = queueName('alarm');
+  const queue = queueName(t, 'alarm');
   const mq = rabbit(t);
   let consumed = 0;
   let held;
@@ -562,12 +593,12 @@ test('consumers keep consuming while the broker blocks publishing', { timeout: 6
 });
 
 test('a handler whose publish hits the hold limit retries in place until there is room', async (t) => {
-  const full = queueName('hold-full');
-  const queue = queueName('hold-in');
-  const out = queueName('hold-out');
+  const full = queueName(t, 'hold-full');
+  const queue = queueName(t, 'hold-in');
+  const out = queueName(t, 'hold-out');
   const mq = rabbit(t, { maxHeldBytes: 1000 });
   mq.declare((ch) => ch.assertQueue(full, { durable: true, arguments: { 'x-max-length': 1, 'x-overflow': 'reject-publish' } }));
-  const dlq = withDeadLetters(mq, queue);
+  const dlq = withDeadLetters(t, mq, queue);
   mq.declare(quorum(out));
   let calls = 0;
   mq.consume(queue, async () => {
@@ -593,10 +624,16 @@ test('consume() needs an explicit prefetch and a known onError', (t) => {
   const mq = noBroker(t);
   assert.throws(() => mq.consume('q', () => {}), /explicit prefetch/);
   assert.throws(() => mq.consume('q', () => {}, { prefetch: 1, onError: 'drop' }), /onError/);
+  assert.throws(() => mq.consume('q', () => {}, { prefetch: 65536 }), /0 to 65535/);
+  for (const retryLimit of [{ attempts: NaN }, { attempts: 0 }, { ms: -1 }, { ms: '5000' }]) {
+    assert.throws(() => mq.consume('q', () => {}, { prefetch: 1, retryLimit }), /retryLimit/);
+  }
+  assert.doesNotThrow(() => mq.consume('q', () => {}, { prefetch: 65535, retryLimit: { attempts: 3, ms: Infinity } }));
 });
 
 test('without a broker: refuses past the hold limit with RetryLater and shuts down promptly', async (t) => {
-  const mq = noBroker(t, { maxHeldBytes: 5000 });
+  // Each held publish counts as its body plus 1536 bytes: room for five 1000-byte bodies.
+  const mq = noBroker(t, { maxHeldBytes: 5 * 2536 });
   await mq.start();
   let refused = 0;
   let closedUnconfirmed = 0;
@@ -607,7 +644,7 @@ test('without a broker: refuses past the hold limit with RetryLater and shuts do
     });
   }
   await assert.rejects(
-    mq.sendToQueue('q', 'z'.repeat(5001)),
+    mq.sendToQueue('q', 'z'.repeat(5 * 2536 + 1)),
     (err) => !(err instanceof RetryLater) && /larger than maxHeldBytes/.test(err.message),
   );
   await sleep(50);
@@ -625,13 +662,14 @@ test('createRabbit rejects options that would disable the hold cap or spin its t
   for (const maxHeldBytes of [NaN, 0, -1, Infinity, null, '512Mi']) {
     assert.throws(() => make({ maxHeldBytes }), /maxHeldBytes must be a positive number/);
   }
-  for (const heartbeat of [NaN, -1, null]) {
-    assert.throws(() => make({ heartbeat }), /heartbeat must be 0 or more/);
+  for (const heartbeat of [NaN, -1, null, 0.5, 65536]) {
+    assert.throws(() => make({ heartbeat }), /heartbeat must be a whole number of seconds/);
   }
   for (const retryDelay of [{ min: NaN }, { max: NaN }, { min: 0 }, { min: 5000, max: 1000 }, { min: null }]) {
     assert.throws(() => make({ retryDelay }), /retryDelay needs 0 < min <= max/);
   }
   assert.doesNotThrow(() => make({ heartbeat: 0, retryDelay: { min: 1, max: 1 } }));
+  assert.doesNotThrow(() => make({ retryDelay: { max: 5000 } }));
 });
 
 test('without a broker: the hold cap defaults to 64 MiB', { timeout: 5000 }, async (t) => {
@@ -643,6 +681,7 @@ test('without a broker: the hold cap defaults to 64 MiB', { timeout: 5000 }, asy
   );
   mq.sendToQueue('q', Buffer.alloc(64 * 2 ** 20)).catch(() => {});
   assert.equal(mq.stats().heldBytes, 64 * 2 ** 20);
+  await assert.rejects(mq.sendToQueue('q', 'x'), RetryLater);
   await mq.close(200);
 });
 
@@ -696,4 +735,164 @@ test('without a broker: start() and close() are idempotent, and close() stays wi
   await assert.rejects(neverStarted.start(), /closed/);
   await sleep(50);
   assert.ok(timeouts() <= before, `${timeouts() - before} timers left running`);
+});
+
+// Wraps amqplib's ConfirmChannel publish for one test, to see what the library puts on the wire.
+async function watchPublishes(t, routingKey) {
+  const proto = await admin((ch) => Object.getPrototypeOf(ch));
+  const original = proto.publish;
+  const seen = { sent: 0, unconfirmed: 0, maxUnconfirmed: 0 };
+  proto.publish = function (exchange, key, content, options, cb) {
+    if (key !== routingKey) return original.call(this, exchange, key, content, options, cb);
+    seen.sent++;
+    seen.maxUnconfirmed = Math.max(seen.maxUnconfirmed, ++seen.unconfirmed);
+    return original.call(this, exchange, key, content, options, (...args) => {
+      seen.unconfirmed--;
+      if (cb) cb(...args);
+    });
+  };
+  t.after(() => (proto.publish = original));
+  return seen;
+}
+
+test('a nacked publish waits out its backoff instead of going out with every other publish', async (t) => {
+  const full = queueName(t, 'nack-backoff-full');
+  const other = queueName(t, 'nack-backoff-other');
+  const mq = rabbit(t, { retryDelay: { min: 500, max: 2000 } });
+  mq.declare((ch) => ch.assertQueue(full, { durable: true, arguments: { 'x-max-length': 1, 'x-overflow': 'reject-publish' } }));
+  mq.declare(quorum(other));
+  await mq.start();
+  await mq.ready(10_000);
+  await mq.sendToQueue(full, 'fills it');
+  const watched = await watchPublishes(t, full);
+  mq.sendToQueue(full, 'nacked').catch(() => {});
+  const end = Date.now() + 1200;
+  while (Date.now() < end) {
+    mq.sendToQueue(other, 'x');
+    await sleep(20);
+  }
+  // Sent at 0 ms and again after 500 ms; the next try is at 1500 ms.
+  assert.ok(watched.sent <= 2, `the nacked publish was sent ${watched.sent} times in 1.2 s`);
+  await mq.close(500);
+});
+
+test('a large held backlog drains without stalling the event loop, at most 256 unconfirmed at once', { timeout: 120_000 }, async (t) => {
+  const queue = queueName(t, 'backlog');
+  const mq = rabbit(t, { maxHeldBytes: 256 * 2 ** 20 });
+  mq.declare((ch) => ch.assertQueue(queue, { durable: true, arguments: { 'x-queue-type': 'classic' } }));
+  const watched = await watchPublishes(t, queue);
+  const count = 100_000;
+  // Held until start(), like a backlog built during an outage.
+  const sends = Array.from({ length: count }, (_, i) => mq.sendToQueue(queue, String(i), { persistent: false }));
+  const lag = monitorEventLoopDelay({ resolution: 10 });
+  lag.enable();
+  await mq.start();
+  await Promise.all(sends);
+  lag.disable();
+  assert.ok(watched.maxUnconfirmed <= 256, `${watched.maxUnconfirmed} publishes unconfirmed at once`);
+  assert.ok(lag.max / 1e6 < 1000, `the event loop stalled for ${Math.round(lag.max / 1e6)} ms`);
+  await mq.close(2000);
+  assert.equal(await depth(queue), count);
+});
+
+test('close() requeues a message whose handler is still waiting for its publish to be confirmed', async (t) => {
+  const full = queueName(t, 'close-full');
+  const queue = queueName(t, 'close-in');
+  const errors = [];
+  const mq = rabbit(t, { log: { ...quiet, error: (line) => errors.push(line) } });
+  mq.declare((ch) => ch.assertQueue(full, { durable: true, arguments: { 'x-max-length': 1, 'x-overflow': 'reject-publish' } }));
+  const dlq = withDeadLetters(t, mq, queue);
+  let started = false;
+  mq.consume(queue, async () => {
+    started = true;
+    await mq.sendToQueue(full, 'nacked until close');
+  }, { prefetch: 1, retryLimit: { attempts: 1 } });
+  await mq.start();
+  await mq.ready(10_000);
+  await mq.sendToQueue(full, 'fills it');
+  await admin((ch) => (ch.sendToQueue(queue, Buffer.from('in')), ch.waitForConfirms()));
+  await until(() => started);
+  await mq.close(1000);
+  // The broker state alone can't show it: the channel close usually overtakes a reject sent at the same moment.
+  assert.deepEqual(errors.filter((line) => /handler failed/.test(line)), []);
+  assert.equal(await depth(queue), 1);
+  assert.equal(await depth(dlq), 0);
+});
+
+test('a dropped consume connection comes back with one subscription per consumer', { timeout: 120_000 }, async (t) => {
+  const queue = queueName(t, 'one-subscription');
+  const mq = rabbit(t);
+  mq.declare(quorum(queue));
+  mq.consume(queue, async () => {}, { prefetch: 1 });
+  await mq.start();
+  await until(async () => (await consumerCount(queue).catch(() => 0)) === 1, 10_000);
+  for (let n = 0; n < 5; n++) {
+    rabbitmqctl('close_all_connections subscription-test');
+    await until(async () => (await consumerCount(queue).catch(() => 0)) >= 1, 30_000);
+    // Longer than any retry timer left over from the drop.
+    await sleep(2500);
+    assert.equal(await consumerCount(queue), 1, `round ${n + 1}`);
+  }
+  await mq.close(2000);
+});
+
+test('a failed declaration is retried until it succeeds', async (t) => {
+  const queue = queueName(t, 'bind-retry');
+  const exchange = queueName(t, 'bind-retry-ex');
+  t.after(() => admin((ch) => ch.deleteExchange(exchange)).catch(() => {}));
+  const mq = rabbit(t);
+  mq.declare(quorum(queue));
+  mq.declare((ch) => ch.bindQueue(queue, exchange, 'k'));
+  await mq.start();
+  await mq.ready(10_000);
+  await admin((ch) => ch.assertExchange(exchange, 'direct', { durable: true }));
+  await until(() => mq.publish(exchange, 'k', 'x').then(() => true, () => false), 15_000);
+  await mq.close(2000);
+  assert.equal(await depth(queue), 1);
+});
+
+test('close() clears the library retry timers, and a round still running starts none', async (t) => {
+  const queue = queueName(t, 'timers');
+  const before = timeouts();
+  const mq = rabbit(t, { retryDelay: { min: 5000, max: 5000 } });
+  mq.declare(quorum(queue));
+  // Fails every time, so a declaration retry is pending when close() runs.
+  mq.declare((ch) => ch.assertQueue(queue, { durable: true, arguments: { 'x-queue-type': 'classic' } }));
+  await mq.start();
+  await mq.ready(10_000);
+  let started;
+  const running = new Promise((resolve) => (started = resolve));
+  mq.declare(async () => {
+    started();
+    await sleep(500);
+    throw new Error('fails after close()');
+  });
+  await running;
+  await mq.close(1000);
+  await sleep(600);
+  assert.ok(timeouts() <= before, `${timeouts() - before} timers left running`);
+});
+
+test('without a broker: ready() and start() reject once close() has started, and leave no timers', async (t) => {
+  const before = timeouts();
+  const mq = noBroker(t);
+  await mq.start();
+  const waiting = mq.ready(60_000);
+  await mq.close(200);
+  await assert.rejects(waiting, /closed/);
+  await assert.rejects(mq.ready(60_000), /closed/);
+  await assert.rejects(mq.start(), /closed/);
+  await sleep(50);
+  assert.ok(timeouts() <= before, `${timeouts() - before} timers left running`);
+});
+
+test('without a broker: publishWithin and ready reject a timeout setTimeout cannot keep', async (t) => {
+  const mq = noBroker(t);
+  await mq.start();
+  for (const ms of [NaN, Infinity, 0, -1, 2 ** 31, '100']) {
+    await assert.rejects(mq.publishWithin(ms, '', 'q', 'x'), TypeError);
+    await assert.rejects(mq.ready(ms), TypeError);
+  }
+  assert.equal(mq.stats().held, 0);
+  await mq.close(200);
 });

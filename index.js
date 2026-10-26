@@ -11,6 +11,12 @@ class RetryLater extends Error {
 }
 
 const ID_HEADER = 'x-mmc-rabbitmq-id';
+// Unconfirmed publishes on the channel at once. amqplib's confirm bookkeeping costs O(n) per confirm, and the search
+// for a publish the broker refused re-sends each of these alone.
+const MAX_IN_FLIGHT = 256;
+// Heap a held publish costs besides its body (job, options, headers, promise), measured on Node 24.
+const JOB_OVERHEAD = 1536;
+const MAX_TIMEOUT = 2 ** 31 - 1;
 const ON_ERROR = {
   reject: 'rejected (dead-lettered if the queue has a dead-letter exchange, otherwise dropped)',
   requeue: 'requeued',
@@ -18,6 +24,8 @@ const ON_ERROR = {
 
 const describe = (err) => (err instanceof Error ? err.message || err.code || err.name : String(err));
 const quietClose = (ch) => Promise.resolve().then(() => ch.close()).catch(() => {});
+const isTimeout = (ms) => typeof ms === 'number' && ms > 0 && ms <= MAX_TIMEOUT;
+const isLimit = (value) => typeof value === 'number' && value > 0;
 
 function within(promise, ms) {
   let timer;
@@ -59,8 +67,9 @@ function createRabbit({
   if (!(Number.isFinite(maxHeldBytes) && maxHeldBytes > 0)) {
     throw new TypeError(`mmc-rabbitmq: maxHeldBytes must be a positive number, got ${maxHeldBytes}`);
   }
-  if (!(Number.isFinite(heartbeat) && heartbeat >= 0)) {
-    throw new TypeError(`mmc-rabbitmq: heartbeat must be 0 or more seconds, got ${heartbeat}`);
+  // amqplib parses the heartbeat as an integer, so 0.5 would turn heartbeats off.
+  if (!(Number.isInteger(heartbeat) && heartbeat >= 0 && heartbeat <= 65535)) {
+    throw new TypeError(`mmc-rabbitmq: heartbeat must be a whole number of seconds from 0 to 65535, got ${heartbeat}`);
   }
   const { min, max } = retryDelay;
   if (!(Number.isFinite(min) && Number.isFinite(max) && min > 0 && min <= max)) {
@@ -68,7 +77,11 @@ function createRabbit({
   }
   const declarations = [];
   const consumers = [];
-  const pending = [];
+  // Every held publish by id, oldest first. `unsent` is the send order of those not on a channel or waiting out a
+  // nack; `suspects` were on a channel the broker closed over one of them, and are re-sent one at a time.
+  const pending = new Map();
+  let unsent = new Set();
+  const suspects = new Set();
   const inFlight = new Set();
   const timers = new Set();
   const wakers = new Set();
@@ -82,13 +95,16 @@ function createRabbit({
   let pubDelay = retryDelay.min;
   let declareDelay = retryDelay.min;
   let declared = false;
+  // The publish connection whose declarations have finished. Publishes wait for it after a reconnect, in case the
+  // topology did not survive the broker; readiness only waits for the first round.
+  let declaredOn = null;
   let declaring = false;
   let redeclare = false;
   let draining = false;
   let refusing = false;
   let timingOut = false;
   let heldBytes = 0;
-  let suspects = 0;
+  let heldCost = 0;
   let declareConn = null;
   let starting = null;
   let closing = null;
@@ -122,7 +138,7 @@ function createRabbit({
 
   function checkReady() {
     if (!isReady()) return;
-    readyWaiters.forEach((resolve) => resolve());
+    readyWaiters.forEach((waiter) => waiter.done());
     readyWaiters.clear();
   }
 
@@ -182,8 +198,10 @@ function createRabbit({
       log.error(`mmc-rabbitmq: publish to ${exchange || routingKey} failed: ${describe(err)}`);
       return rejected(err);
     }
-    if (heldBytes + content.length > maxHeldBytes) {
-      if (!refusing) log.error(`mmc-rabbitmq: refusing publishes, ${heldBytes} bytes already held (limit ${maxHeldBytes})`);
+    const cost = content.length + JOB_OVERHEAD;
+    // The first publish is always held, so a body that fits the cap without its overhead is not refused forever.
+    if (pending.size && heldCost + cost > maxHeldBytes) {
+      if (!refusing) log.error(`mmc-rabbitmq: refusing publishes, ${pending.size} already held (limit ${maxHeldBytes} bytes)`);
       refusing = true;
       // A handler that awaits this publish retries its message in place instead of failing it.
       return rejected(new RetryLater('mmc-rabbitmq: hold limit reached'));
@@ -191,12 +209,14 @@ function createRabbit({
     refusing = false;
     const id = randomUUID();
     const headers = { ...options?.headers, [ID_HEADER]: id };
-    const job = { id, exchange, routingKey, content, ch: null, done: false, suspect: false };
+    const job = { id, exchange, routingKey, content, cost, ch: null, done: false, nacks: 0 };
     job.options = { persistent: true, mandatory: true, contentType, messageId: id, ...options, headers };
     job.promise = new Promise((resolve, reject) => Object.assign(job, { resolve, reject }));
     job.promise.catch(() => {});
     heldBytes += content.length;
-    pending.push(job);
+    heldCost += cost;
+    pending.set(id, job);
+    unsent.add(job);
     flush();
     return job;
   }
@@ -204,66 +224,83 @@ function createRabbit({
   function finish(job, err, quiet = false) {
     if (job.done) return;
     job.done = true;
-    pending.splice(pending.indexOf(job), 1);
+    pending.delete(job.id);
+    unsent.delete(job);
+    suspects.delete(job);
     heldBytes -= job.content.length;
-    if (job.suspect) suspects--;
+    heldCost -= job.cost;
     if (err && !quiet) log.error(`mmc-rabbitmq: publish to ${job.exchange || job.routingKey} failed: ${describe(err)}`);
     if (err) job.reject(err);
     else job.resolve();
-    if (!pending.length) idleWaiters.splice(0).forEach((resolve) => resolve());
+    if (!pending.size) idleWaiters.splice(0).forEach((resolve) => resolve());
   }
 
   function flush() {
     const ch = pubCh;
-    if (!ch || draining || !declared) return;
-    // After the broker closed the channel over a publish, re-send the suspects one at a time to find the bad one.
-    const suspect = suspects > 0 && pending.find((job) => job.suspect);
-    if (suspect) {
-      if (!suspect.ch && !pending.some((job) => job.ch === ch)) send(ch, suspect);
+    if (!ch || draining || declaredOn !== pub.model) return;
+    if (suspects.size) {
+      // Alone on the channel, so a close blames only this one; a timed-out publish still on it counts.
+      const [suspect] = suspects;
+      if (!ch.flying.size) send(ch, suspect);
       return;
     }
-    for (const job of pending) {
-      if (!job.ch && !send(ch, job)) return;
+    for (const job of unsent) {
+      if (ch.flying.size >= MAX_IN_FLIGHT || !send(ch, job)) return;
     }
   }
 
   function send(ch, job) {
-    job.ch = ch;
     let ok;
     try {
-      ok = ch.publish(job.exchange, job.routingKey, job.content, job.options, (err) => {
-        if (job.done || job.ch !== ch) return;
-        if (err) {
-          // A nack leaves the channel open, so the message did not break it: hold it and retry. A closed channel
-          // is handled on 'close'.
-          queueMicrotask(() => {
-            if (job.done || job.ch !== ch) return;
-            job.ch = null;
-            if (job.suspect) {
-              job.suspect = false;
-              suspects--;
-            }
-            later(flush, retryDelay.min);
-          });
-          return;
-        }
-        pubDelay = retryDelay.min;
-        timingOut = false;
-        if (job.returned) finish(job, new Error(`mmc-rabbitmq: unroutable, no queue bound for ${job.routingKey}`));
-        else finish(job);
-        if (job.suspect) flush();
-      });
+      ok = ch.publish(job.exchange, job.routingKey, job.content, job.options, (err) => onConfirm(ch, job, err));
     } catch (err) {
-      if (pubCh !== ch || closedChannels.has(ch)) {
-        job.ch = null;
-        return false;
-      }
+      if (pubCh !== ch || closedChannels.has(ch)) return false;
       // The channel is fine, so the message itself is invalid. Finish it outside the loop that is sending.
-      queueMicrotask(() => finish(job, err));
+      unsent.delete(job);
+      queueMicrotask(() => {
+        finish(job, err);
+        flush();
+      });
       return true;
     }
+    job.ch = ch;
+    ch.flying.add(job);
+    unsent.delete(job);
     if (!ok) draining = true;
     return ok;
+  }
+
+  function onConfirm(ch, job, err) {
+    if (err) {
+      // amqplib also calls back with an error for every unconfirmed publish when the channel closes, just before
+      // 'close'; onPublisherClosed handles those. Anything else is a nack: the channel is fine, the broker refused.
+      queueMicrotask(() => {
+        if (closedChannels.has(ch)) return;
+        ch.flying.delete(job);
+        job.ch = null;
+        if (!job.done) park(job);
+        flush();
+      });
+      return;
+    }
+    ch.flying.delete(job);
+    job.ch = null;
+    pubDelay = retryDelay.min;
+    timingOut = false;
+    if (job.returned) finish(job, new Error(`mmc-rabbitmq: unroutable, no queue bound for ${job.routingKey}`));
+    else finish(job);
+    flush();
+  }
+
+  // A nacked publish (for example to a full reject-publish queue) waits before it is sent again, longer each time.
+  function park(job) {
+    suspects.delete(job);
+    job.nacks++;
+    later(() => {
+      if (job.done) return;
+      unsent.add(job);
+      flush();
+    }, Math.min(retryDelay.min * 2 ** (job.nacks - 1), retryDelay.max));
   }
 
   // Still opens while close() drains, so publishes held through an outage go out if the broker returns in time.
@@ -274,6 +311,7 @@ function createRabbit({
       (ch) => {
         pubOpening = false;
         if (stopped || pub.model !== model) return quietClose(ch);
+        ch.flying = new Set();
         let failure = null;
         ch.on('error', (err) => {
           failure = err;
@@ -285,7 +323,7 @@ function createRabbit({
           flush();
         });
         ch.on('return', (msg) => {
-          const job = pending.find((j) => j.id === msg.properties.headers?.[ID_HEADER]);
+          const job = pending.get(msg.properties.headers?.[ID_HEADER]);
           if (job) job.returned = true;
         });
         pubCh = ch;
@@ -304,29 +342,35 @@ function createRabbit({
   function onPublisherClosed(ch, model, failure) {
     closedChannels.add(ch);
     if (pubCh === ch) pubCh = null;
-    const sent = pending.filter((job) => job.ch === ch);
+    // Includes publishes that timed out while on the channel: one of them may be the one the broker refused.
+    const sent = [...ch.flying];
+    ch.flying.clear();
     sent.forEach((job) => (job.ch = null));
     const missing = failure?.code === 404 && /no exchange '([^']*)'/.exec(failure.message);
-    let found = !failure;
+    let identified = false;
     if (missing) {
       sent.filter((job) => job.exchange === missing[1]).forEach((job) => finish(job, failure));
-      found = true;
+      identified = true;
     } else if (failure && sent.length === 1) {
       finish(sent[0], failure);
-      found = true;
+      identified = true;
     } else if (failure) {
-      for (const job of sent) {
-        if (!job.suspect) suspects++;
-        job.suspect = true;
-      }
+      sent.filter((job) => !job.done).forEach((job) => suspects.add(job));
     }
-    // Back off only while the cause is unknown; a lost connection or an identified bad publish reopens at once.
-    if (found) pubDelay = retryDelay.min;
-    reopenPublisher(model, !found);
+    if (identified && suspects.size) {
+      // Usually one bad publish: send the rest normally again. Another bad one starts a new search.
+      sent.push(...suspects);
+      suspects.clear();
+    }
+    unsent = new Set([...sent.filter((job) => !job.done && !suspects.has(job)), ...unsent]);
+    // Back off only while the cause is unknown.
+    const known = !failure || identified;
+    if (known) pubDelay = retryDelay.min;
+    reopenPublisher(model, !known);
   }
 
   function reopenPublisher(model, backoff = true) {
-    const delay = pubDelay;
+    const delay = backoff ? pubDelay : 0;
     if (backoff) pubDelay = Math.min(pubDelay * 2, retryDelay.max);
     later(() => openPublisher(model), delay);
   }
@@ -337,12 +381,13 @@ function createRabbit({
   function runDeclarations(list = declarations) {
     if (stopped) return;
     if (declaring) return void (redeclare = true);
-    if (!list.length) return markDeclared();
+    const model = pub.model;
+    if (!list.length) return markDeclared(model);
     declaring = true;
     redeclare = false;
     declareEach([...list]).then((failed) => {
       declaring = false;
-      markDeclared();
+      markDeclared(model);
       if (failed.length) {
         const delay = declareDelay;
         declareDelay = Math.min(declareDelay * 2, retryDelay.max);
@@ -400,10 +445,12 @@ function createRabbit({
     return conn;
   }
 
-  function markDeclared() {
+  // A round that a reconnect overtook does not release publishes on the new connection.
+  function markDeclared(model) {
+    if (model && model === pub.model) declaredOn = model;
+    flush();
     if (declared) return;
     declared = true;
-    flush();
     checkReady();
     consumers.forEach(subscribe);
   }
@@ -418,10 +465,9 @@ function createRabbit({
       .createChannel()
       .finally(() => (consumer.opening = false))
       .then(async (ch) => {
-        if (closing || sub.model !== model) return quietClose(ch);
+        if (closing || sub.model !== model) return void quietClose(ch);
         const live = new AbortController();
         consumer.ch = ch;
-        consumer.signal = live.signal;
         ch.on('error', (err) => log.warn(`mmc-rabbitmq: broker closed the ${consumer.queue} channel: ${describe(err)}`));
         ch.on('close', () => {
           closedChannels.add(ch);
@@ -431,20 +477,24 @@ function createRabbit({
           consumer.tag = null;
           if (!closing && sub.model === model) retry(consumer);
         });
-        await ch.prefetch(consumer.prefetch);
-        await startConsuming(consumer, ch);
+        // A failed subscribe closes its channel, so the next attempt starts clean on a new one.
+        try {
+          await ch.prefetch(consumer.prefetch);
+          if (closing) return void quietClose(ch);
+          const { consumerTag } = await ch.consume(consumer.queue, (msg) => onMessage(consumer, ch, live.signal, msg));
+          // close() only cancels subscriptions it can see; this one completed after it looked.
+          if (closing) return void ch.cancel(consumerTag).catch(() => {});
+          consumer.tag = consumerTag;
+          consumer.delay = retryDelay.min;
+        } catch (err) {
+          quietClose(ch);
+          throw err;
+        }
       })
       .catch((err) => {
         log.warn(`mmc-rabbitmq: subscribing to ${consumer.queue} failed: ${describe(err)}`);
         if (!closing && sub.model === model) retry(consumer);
       });
-  }
-
-  async function startConsuming(consumer, ch) {
-    const signal = consumer.signal;
-    const { consumerTag } = await ch.consume(consumer.queue, (msg) => onMessage(consumer, ch, signal, msg));
-    consumer.tag = consumerTag;
-    consumer.delay = retryDelay.min;
   }
 
   function retry(consumer) {
@@ -454,12 +504,8 @@ function createRabbit({
     consumer.timer = true;
     later(() => {
       consumer.timer = false;
-      if (closing || consumer.tag) return;
-      if (!consumer.ch) return subscribe(consumer);
-      startConsuming(consumer, consumer.ch).catch((err) => {
-        log.warn(`mmc-rabbitmq: resubscribing to ${consumer.queue} failed: ${describe(err)}`);
-        retry(consumer);
-      });
+      // Only through subscribe(): a channel that is still subscribing must not get a second consumer.
+      if (!closing && !consumer.ch) subscribe(consumer);
     }, delay);
   }
 
@@ -487,13 +533,14 @@ function createRabbit({
           await handler(msg, { signal });
           return settle(ch, msg, 'ack');
         } catch (err) {
+          // Includes the RetryLater that close() gives publishes it could not send: the handler did nothing wrong.
+          if (err instanceof RetryLater && gone()) return settle(ch, msg, 'requeue');
           const exhausted = attempt >= retryLimit.attempts || Date.now() - firstTry + delay > retryLimit.ms;
           if (!(err instanceof RetryLater) || exhausted) {
             const retried = err instanceof RetryLater ? ` after ${attempt} attempts` : '';
             log.error(`mmc-rabbitmq: ${queue} handler failed${retried}, ${ON_ERROR[onError]}: ${describe(err)}`);
             return settle(ch, msg, onError);
           }
-          if (gone()) return settle(ch, msg, 'requeue');
           log.warn(`mmc-rabbitmq: ${queue} retrying in ${delay} ms: ${describe(err)}`);
           await sleep(delay);
           if (gone()) return settle(ch, msg, 'requeue');
@@ -524,7 +571,7 @@ function createRabbit({
   // Lifecycle
 
   function start() {
-    if (closing && !starting) return Promise.reject(new Error('mmc-rabbitmq: closed'));
+    if (closing) return Promise.reject(new Error('mmc-rabbitmq: closed'));
     starting ??= Promise.resolve().then(() => {
       pub = connect('publish', (model) => {
         openPublisher(model);
@@ -537,7 +584,9 @@ function createRabbit({
   }
 
   function close(graceMs = 25_000) {
-    closing ??= shutdown(graceMs);
+    // setTimeout turns NaN or Infinity into 1 ms, which would skip the drain.
+    if (!(typeof graceMs === 'number' && graceMs >= 0)) graceMs = 25_000;
+    closing ??= shutdown(Math.min(graceMs, MAX_TIMEOUT));
     return closing;
   }
 
@@ -555,12 +604,15 @@ function createRabbit({
     await within(Promise.allSettled(cancels), left());
     wakers.forEach((wake) => wake());
     await within(Promise.allSettled([...inFlight]), left());
-    if (pending.length) await within(new Promise((resolve) => idleWaiters.push(resolve)), left());
-    if (pending.length) log.error(`mmc-rabbitmq: ${pending.length} publishes unconfirmed at shutdown`);
-    [...pending].forEach((job) => finish(job, new Error('mmc-rabbitmq: closed before the broker confirmed'), true));
+    if (pending.size) await within(new Promise((resolve) => idleWaiters.push(resolve)), left());
+    if (pending.size) log.error(`mmc-rabbitmq: ${pending.size} publishes unconfirmed at shutdown`);
+    // RetryLater, so a handler awaiting one of these requeues its message instead of failing it.
+    [...pending.values()].forEach((job) => finish(job, new RetryLater('mmc-rabbitmq: closed before the broker confirmed'), true));
     stopped = true;
     timers.forEach(clearTimeout);
     timers.clear();
+    readyWaiters.forEach((waiter) => waiter.fail());
+    readyWaiters.clear();
     declareConn?.close().catch(() => {});
     // Close channels first: a connection close can overtake acks still queued on a channel.
     const channels = [pubCh, ...consumers.map((c) => c.ch)].filter(Boolean);
@@ -579,11 +631,15 @@ function createRabbit({
       if (pub?.model) runDeclarations();
     },
     consume(queue, handler, { prefetch, onError = 'reject', retryLimit = {} } = {}) {
-      if (!Number.isInteger(prefetch) || prefetch < 0) {
-        throw new TypeError(`mmc-rabbitmq: consume('${queue}') needs an explicit prefetch (0 or more)`);
+      // AMQP carries the prefetch in 16 bits; a larger value fails inside amqplib and leaves the consumer dead.
+      if (!Number.isInteger(prefetch) || prefetch < 0 || prefetch > 65535) {
+        throw new TypeError(`mmc-rabbitmq: consume('${queue}') needs an explicit prefetch (0 to 65535)`);
       }
       if (!ON_ERROR[onError]) throw new TypeError(`mmc-rabbitmq: onError must be 'reject' or 'requeue'`);
       const { attempts = Infinity, ms = Infinity } = retryLimit;
+      if (!isLimit(attempts) || !isLimit(ms)) {
+        throw new TypeError(`mmc-rabbitmq: retryLimit attempts and ms must be positive numbers, got ${attempts} and ${ms}`);
+      }
       const consumer = { queue, handler, prefetch, onError, retryLimit: { attempts, ms }, delay: retryDelay.min };
       consumers.push(consumer);
       if (starting) {
@@ -597,33 +653,48 @@ function createRabbit({
     publish: (exchange, routingKey, body, options) => enqueue(exchange, routingKey, body, options).promise,
     sendToQueue: (queue, body, options) => enqueue('', queue, body, options).promise,
     publishWithin(ms, exchange, routingKey, body, options) {
+      if (!isTimeout(ms)) {
+        const err = new TypeError(`mmc-rabbitmq: publishWithin needs 0 < ms <= ${MAX_TIMEOUT}, got ${ms}`);
+        log.error(`mmc-rabbitmq: publish to ${exchange || routingKey} failed: ${describe(err)}`);
+        return rejected(err).promise;
+      }
       const job = enqueue(exchange, routingKey, body, options);
       if (!job.id) return job.promise;
       const timer = setTimeout(() => {
         if (!timingOut) log.warn(`mmc-rabbitmq: publishes are timing out, no broker confirm within ${ms} ms`);
         timingOut = true;
         finish(job, new Error(`mmc-rabbitmq: no broker confirm within ${ms} ms`), true);
+        // It may have been the next suspect, or the last one.
+        flush();
       }, ms);
       const promise = job.promise.finally(() => clearTimeout(timer));
       promise.catch(() => {});
       return promise;
     },
     ready(ms) {
+      if (closing) return Promise.reject(new Error('mmc-rabbitmq: closed'));
+      if (!isTimeout(ms)) return Promise.reject(new TypeError(`mmc-rabbitmq: ready needs 0 < ms <= ${MAX_TIMEOUT}, got ${ms}`));
       if (isReady()) return Promise.resolve();
       return new Promise((resolve, reject) => {
-        const done = () => {
-          clearTimeout(timer);
-          resolve();
+        const waiter = {
+          done() {
+            clearTimeout(timer);
+            resolve();
+          },
+          fail() {
+            clearTimeout(timer);
+            reject(new Error('mmc-rabbitmq: closed'));
+          },
         };
         const timer = setTimeout(() => {
-          readyWaiters.delete(done);
+          readyWaiters.delete(waiter);
           reject(new Error(`mmc-rabbitmq: not ready within ${ms} ms`));
         }, ms);
-        readyWaiters.add(done);
+        readyWaiters.add(waiter);
       });
     },
     stats: () => ({
-      held: pending.length,
+      held: pending.size,
       heldBytes,
       inFlight: inFlight.size,
       blocked: Boolean(pub?.blocked),
