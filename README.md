@@ -103,7 +103,9 @@ a rejection nobody handles does not crash the process; the library logs it.
 `maxHeldBytes` (64 MiB by default) caps the memory held for unconfirmed publishes. Set it below the memory the
 process has to spare, or an outage long enough to fill it can get the process killed and lose what it held. Once
 the cap is reached, new publishes reject with `RetryLater`, so a handler that awaits one retries its message in
-place instead of failing it.
+place instead of failing it. The handler runs again from the start, so work it did before the publish runs again:
+publish before side effects that must not repeat, or make them idempotent. `retryLimit` applies, after which the
+message gets its `onError` outcome.
 
 `publishWithin(ms, …)` rejects if the broker has not confirmed in time and stops holding the message. The message
 may still be delivered, so retrying after a rejection can duplicate it.
