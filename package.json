@@ -14,7 +14,7 @@
     "node": ">=18"
   },
   "scripts": {
-    "test": "node --test --test-concurrency=1 \"test/**/*.test.js\""
+    "test": "node --test --test-concurrency=1 --test-timeout=120000 \"test/**/*.test.js\""
   },
   "peerDependencies": {
     "amqplib": "2.2.0"

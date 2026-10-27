@@ -1311,3 +1311,53 @@ test('declarations whose connection fails to open run on the retry', async (t) =
   await mq.close(500);
 });
 
+test('a subscribe that fails because close() started is not logged', async (t) => {
+  const queue = queueName(t, 'subscribe-at-close');
+  await admin(quorum(queue));
+  const conn = await amqplib.connect(URL);
+  const proto = Object.getPrototypeOf(conn);
+  await conn.close();
+  const original = proto.createChannel;
+  let entered;
+  const inCreate = new Promise((resolve) => (entered = resolve));
+  // The consumer's channel is still being created when close() runs, then the connection reports it lost.
+  proto.createChannel = function () {
+    entered();
+    return sleep(300).then(() => {
+      throw new Error('channel lost');
+    });
+  };
+  t.after(() => (proto.createChannel = original));
+  const warnings = [];
+  const mq = rabbit(t, { log: { ...quiet, warn: (line) => warnings.push(line) } });
+  mq.consume(queue, async () => {}, { prefetch: 1 });
+  await mq.start();
+  await inCreate;
+  await mq.close(1000);
+  await sleep(500);
+  assert.deepEqual(warnings.filter((line) => /subscribing to/.test(line)), []);
+});
+
+test('a declare connection that fails because close() started is not logged', async (t) => {
+  const original = amqplib.connect;
+  let connecting;
+  const started = new Promise((resolve) => (connecting = resolve));
+  amqplib.connect = async function (url, options) {
+    if (/\(declare\)$/.test(options?.clientProperties?.connection_name)) {
+      connecting();
+      await sleep(400);
+      throw new Error('connection refused');
+    }
+    return original.call(this, url, options);
+  };
+  t.after(() => (amqplib.connect = original));
+  const errors = [];
+  const mq = rabbit(t, { log: { ...quiet, error: (line) => errors.push(line) } });
+  mq.declare(async () => {});
+  await mq.start();
+  await started;
+  await mq.close(1000);
+  await sleep(600);
+  assert.deepEqual(errors.filter((line) => /declaring topology failed/.test(line)), []);
+});
+
