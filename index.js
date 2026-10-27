@@ -214,7 +214,7 @@ function createRabbit({
     refusing = false;
     const id = randomUUID();
     const headers = { ...options?.headers, [ID_HEADER]: id };
-    const job = { id, exchange, routingKey, content, cost, ch: null, done: false, nacks: 0 };
+    const job = { id, exchange, routingKey, content, cost, done: false, nacks: 0 };
     job.options = { persistent: true, mandatory: true, contentType, messageId: id, ...options, headers };
     job.promise = new Promise((resolve, reject) => Object.assign(job, { resolve, reject }));
     job.promise.catch(() => {});
@@ -275,7 +275,6 @@ function createRabbit({
       });
       return true;
     }
-    job.ch = ch;
     ch.flying.add(job);
     unsent.delete(job);
     if (!ok) draining = true;
@@ -289,14 +288,12 @@ function createRabbit({
       queueMicrotask(() => {
         if (closedChannels.has(ch)) return;
         ch.flying.delete(job);
-        job.ch = null;
         if (!job.done) park(job);
         flush();
       });
       return;
     }
     ch.flying.delete(job);
-    job.ch = null;
     pubDelay = retryDelay.min;
     timingOut = false;
     if (job.returned) finish(job, new Error(`mmc-rabbitmq: unroutable, no queue bound for ${job.routingKey}`));
@@ -357,7 +354,6 @@ function createRabbit({
     // Includes publishes that timed out while on the channel: one of them may be the one the broker refused.
     const sent = [...ch.flying];
     ch.flying.clear();
-    sent.forEach((job) => (job.ch = null));
     const missing = failure?.code === 404 && /no exchange '([^']*)'/.exec(failure.message);
     let identified = false;
     if (missing) {
