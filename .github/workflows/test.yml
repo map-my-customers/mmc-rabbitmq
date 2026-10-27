@@ -1,0 +1,37 @@
+name: test
+
+on:
+  pull_request:
+  push:
+    branches: [master]
+
+jobs:
+  broker:
+    name: broker-${{ matrix.rabbitmq }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    strategy:
+      fail-fast: false
+      matrix:
+        rabbitmq: ['3.13', '4.2', '4.3']
+    steps:
+      - uses: actions/checkout@v6
+      - uses: actions/setup-node@v6
+        with:
+          node-version: 24
+          cache: npm
+      - name: Start RabbitMQ ${{ matrix.rabbitmq }}
+        run: |
+          docker run -d --name rabbit -p 5672:5672 rabbitmq:${{ matrix.rabbitmq }}-management
+          for _ in $(seq 1 60); do
+            # As the rabbitmq user: run as root, the CLI creates the Erlang cookie first and the broker can't read it.
+            docker exec -u rabbitmq rabbit rabbitmq-diagnostics -q check_port_connectivity && exit 0
+            sleep 2
+          done
+          docker logs rabbit
+          exit 1
+      - run: npm ci
+      - run: npm test
+        env:
+          RABBIT_URL: amqp://guest:guest@localhost:5672
+          RABBIT_CONTAINER: rabbit
