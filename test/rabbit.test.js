@@ -1071,3 +1071,243 @@ test('publishes made while amqplib closes the publish channel itself are held, n
   await mq.close(2000);
   assert.equal(await depth(queue), 20);
 });
+
+// The heartbeat each connection whose name contains `name` agreed with the broker.
+const heartbeats = (name) =>
+  execSync(`docker exec -u rabbitmq ${CONTAINER} rabbitmqctl -q list_connections client_properties timeout`, {
+    encoding: 'utf8',
+    timeout: 60_000,
+  })
+    .split('\n')
+    .filter((line) => line.includes(name))
+    .map((line) => Number(line.trim().split(/\s+/).pop()));
+
+// Wraps amqplib's ConfirmChannel.publish for one test; hook(key, cb) returns the confirm callback to use.
+async function patchPublish(t, hook) {
+  const proto = await admin((ch) => Object.getPrototypeOf(ch));
+  const original = proto.publish;
+  proto.publish = function (exchange, key, content, options, cb) {
+    return original.call(this, exchange, key, content, options, hook(key, cb));
+  };
+  t.after(() => (proto.publish = original));
+}
+
+test('an unroutable publish rejects even when the caller passes headers', async (t) => {
+  const mq = rabbit(t);
+  await mq.start();
+  await mq.ready(10_000);
+  await assert.rejects(mq.sendToQueue(`no-such-queue-${process.pid}`, 'x', { headers: { trace: 'abc' } }), /unroutable/);
+  await mq.close(2000);
+});
+
+test('a publishWithin that timed out while held is never sent later', async (t) => {
+  const queue = queueName(t, 'late-held');
+  const mq = rabbit(t);
+  let release;
+  const gate = new Promise((resolve) => (release = resolve));
+  mq.declare(quorum(queue));
+  mq.declare(async () => gate);
+  await mq.start();
+  await assert.rejects(mq.publishWithin(300, '', queue, 'too late'), /no broker confirm within 300 ms/);
+  assert.equal(mq.stats().held, 0);
+  release();
+  await mq.ready(10_000);
+  await sleep(500);
+  await mq.close(2000);
+  assert.equal(await depth(queue), 0);
+});
+
+test('a publishWithin that timed out while waiting out a nack is never sent later', async (t) => {
+  const full = queueName(t, 'late-parked');
+  const mq = rabbit(t);
+  mq.declare((ch) => ch.assertQueue(full, { durable: true, arguments: { 'x-max-length': 1, 'x-overflow': 'reject-publish' } }));
+  await mq.start();
+  await mq.ready(10_000);
+  await mq.sendToQueue(full, 'fills it');
+  await assert.rejects(mq.publishWithin(300, '', full, 'too late'), /no broker confirm within 300 ms/);
+  await admin((ch) => ch.purgeQueue(full));
+  await sleep(1500);
+  assert.equal(await depth(full), 0);
+  await mq.close(500);
+});
+
+test('the confirm of a publish that timed out does not unbalance the held counters', async (t) => {
+  const queue = queueName(t, 'late-confirm');
+  const mq = rabbit(t);
+  mq.declare(quorum(queue));
+  await mq.start();
+  await mq.ready(10_000);
+  await patchPublish(t, (key, cb) => (key === queue ? (...args) => setTimeout(() => cb(...args), 500) : cb));
+  await assert.rejects(mq.publishWithin(100, '', queue, 'x'), /no broker confirm within 100 ms/);
+  await sleep(800);
+  assert.deepEqual([mq.stats().held, mq.stats().heldBytes], [0, 0]);
+  await mq.close(500);
+});
+
+test('publishes held two at a time never reach a cap they fit under', async (t) => {
+  const queue = queueName(t, 'cap-leak');
+  const mq = rabbit(t, { maxHeldBytes: 20_000 });
+  mq.declare(quorum(queue));
+  await mq.start();
+  await mq.ready(10_000);
+  // Each counts 1000 + 1536 bytes: two fit, and 60 in total would not if the count never went down.
+  for (let i = 0; i < 30; i++) {
+    await Promise.all([mq.sendToQueue(queue, 'x'.repeat(1000)), mq.sendToQueue(queue, 'x'.repeat(1000))]);
+  }
+  assert.deepEqual([mq.stats().held, mq.stats().heldBytes], [0, 0]);
+  await mq.close(2000);
+  assert.equal(await depth(queue), 60);
+});
+
+test('publishing pauses when amqplib reports a full buffer and resumes on drain', { timeout: 60_000 }, async (t) => {
+  const queue = queueName(t, 'backpressure');
+  const mq = rabbit(t);
+  mq.declare(quorum(queue));
+  await mq.start();
+  await mq.ready(10_000);
+  // Every 10th publish reports a full buffer, and 'drain' follows 20 ms later.
+  const events = [];
+  const watched = new WeakSet();
+  const proto = await admin((ch) => Object.getPrototypeOf(ch));
+  const original = proto.publish;
+  let calls = 0;
+  proto.publish = function (...args) {
+    if (!watched.has(this)) {
+      watched.add(this);
+      this.prependListener('drain', () => events.push('drain'));
+    }
+    original.apply(this, args);
+    if (++calls % 10 !== 0) {
+      events.push('publish');
+      return true;
+    }
+    events.push('full');
+    setTimeout(() => this.emit('drain'), 20);
+    return false;
+  };
+  t.after(() => (proto.publish = original));
+  await Promise.all(Array.from({ length: 100 }, (_, i) => mq.sendToQueue(queue, { i })));
+  assert.ok(events.includes('full'));
+  let full = false;
+  for (const event of events) {
+    if (event === 'drain') full = false;
+    else assert.equal(full, false, 'a publish went out between a full buffer and its drain');
+    if (event === 'full') full = true;
+  }
+  await mq.close(2000);
+  assert.equal(await depth(queue), 100);
+});
+
+test('close() stays within its grace when the broker stops answering', { timeout: 60_000 }, async (t) => {
+  const queue = queueName(t, 'paused');
+  const mq = rabbit(t);
+  mq.declare(quorum(queue));
+  mq.consume(queue, () => new Promise(() => {}), { prefetch: 1 });
+  await mq.start();
+  await mq.ready(10_000);
+  await until(() => mq.stats().subscribed === 1, 10_000);
+  await mq.sendToQueue(queue, 'stuck in the handler');
+  await until(() => mq.stats().inFlight === 1, 10_000);
+  execSync(`docker pause ${CONTAINER}`, { stdio: 'ignore' });
+  let outcome;
+  const begun = Date.now();
+  try {
+    mq.sendToQueue(queue, 'never confirmed').catch(() => {});
+    outcome = await Promise.race([mq.close(1000).then(() => 'closed'), sleep(8000).then(() => 'hung')]);
+  } finally {
+    execSync(`docker unpause ${CONTAINER}`, { stdio: 'ignore' });
+  }
+  assert.equal(outcome, 'closed');
+  assert.ok(Date.now() - begun < 3000, `close(1000) took ${Date.now() - begun} ms`);
+});
+
+test('close() with no grace period, or one that is not a number of ms, waits for a running handler', async (t) => {
+  for (const grace of [undefined, NaN, -1, '500']) {
+    const queue = queueName(t, 'close-default');
+    const mq = rabbit(t);
+    let started = false;
+    let finished = false;
+    mq.declare(quorum(queue));
+    mq.consume(queue, async () => {
+      started = true;
+      await sleep(400);
+      finished = true;
+    }, { prefetch: 1 });
+    await mq.start();
+    await mq.sendToQueue(queue, 'x');
+    await until(() => started);
+    await mq.close(grace);
+    assert.equal(finished, true, `close(${String(grace)}) did not wait for the handler`);
+  }
+});
+
+test('the heartbeat option applies unless the URL or the URL object sets its own', async (t) => {
+  const heartbeatOf = async (options) => {
+    const name = `mmc-rabbitmq-heartbeat-${process.pid}-${++counter}`;
+    const mq = rabbit(t, { name, ...options });
+    await mq.start();
+    await mq.ready(10_000);
+    const found = heartbeats(`${name} (publish)`);
+    await mq.close(500);
+    assert.equal(found.length, 1);
+    return found[0];
+  };
+  assert.equal(await heartbeatOf({}), 60);
+  assert.equal(await heartbeatOf({ heartbeat: 20 }), 20);
+  assert.equal(await heartbeatOf({ url: `${URL}?heartbeat=7`, heartbeat: 20 }), 7);
+  const parsed = new globalThis.URL(URL);
+  const object = { protocol: 'amqp', hostname: parsed.hostname, port: Number(parsed.port), username: 'guest', password: 'guest' };
+  assert.equal(await heartbeatOf({ url: { ...object, heartbeat: 9 }, heartbeat: 20 }), 9);
+});
+
+test('a consumer of a missing queue retries with a growing delay, not in a loop', async (t) => {
+  const absent = queueName(t, 'absent');
+  const warnings = [];
+  const mq = rabbit(t, { log: { ...quiet, warn: (line) => warnings.push(line) } });
+  mq.declare(quorum(queueName(t, 'present')));
+  mq.consume(absent, async () => {}, { prefetch: 1 });
+  await mq.start();
+  await mq.ready(10_000);
+  const attempts = () => warnings.filter((line) => line.includes(`subscribing to ${absent} failed`)).length;
+  const before = attempts();
+  await sleep(1500);
+  // At about 0, 200, 600 and 1400 ms.
+  assert.ok(attempts() - before >= 2 && attempts() - before <= 5, `${attempts() - before} subscribe attempts in 1.5 s`);
+  await mq.close(500);
+});
+
+test('a failing declaration is retried with a growing delay, and the others are not run again', async (t) => {
+  const mq = rabbit(t);
+  let good = 0;
+  let failing = 0;
+  mq.declare(async () => void good++);
+  mq.declare(async () => {
+    failing++;
+    throw new Error('always fails');
+  });
+  await mq.start();
+  await sleep(1500);
+  // At about 0, 200, 600 and 1400 ms.
+  assert.ok(failing >= 2 && failing <= 5, `${failing} runs of the failing declaration in 1.5 s`);
+  assert.equal(good, 1);
+  await mq.close(500);
+});
+
+test('declarations whose connection fails to open run on the retry', async (t) => {
+  const original = amqplib.connect;
+  let declareConnects = 0;
+  amqplib.connect = async function (url, options) {
+    if (/\(declare\)$/.test(options?.clientProperties?.connection_name) && declareConnects++ === 0) {
+      throw new Error('refused by the test');
+    }
+    return original.call(this, url, options);
+  };
+  t.after(() => (amqplib.connect = original));
+  const queue = queueName(t, 'declare-connect-fails');
+  const mq = rabbit(t);
+  mq.declare(quorum(queue));
+  await mq.start();
+  await until(() => exists(queue), 5000);
+  await mq.close(500);
+});
+
