@@ -17,8 +17,10 @@ const MAX_IN_FLIGHT = 256;
 // Heap a held publish costs besides its body (job, options, headers, promise), measured on Node 24.
 const JOB_OVERHEAD = 1536;
 const MAX_TIMEOUT = 2 ** 31 - 1;
-// How long one declaration, or opening the declare connection, may take before it counts as failed.
+// How long one declaration may take before it counts as failed.
 const DECLARE_TIMEOUT = 10_000;
+// How long opening a connection may take. A broker that accepts the socket but never answers would otherwise hold it open.
+const CONNECT_TIMEOUT = 10_000;
 const ON_ERROR = {
   reject: 'rejected (dead-lettered if the queue has a dead-letter exchange, otherwise dropped)',
   requeue: 'requeued',
@@ -150,6 +152,7 @@ function createRabbit({
     const state = { conn: null, model: null, blocked: false };
     state.opened = amqp
       .connect(withHeartbeat(url, heartbeat), {
+        timeout: CONNECT_TIMEOUT,
         clientProperties: { connection_name: `${name} (${role})` },
         recovery: { initialDelay: retryDelay.min, maxDelay: retryDelay.max, maxRetries: Infinity, waitForConnect: false },
       })
@@ -455,7 +458,7 @@ function createRabbit({
 
   async function openDeclareConnection() {
     const model = await amqp.connect(withHeartbeat(url, heartbeat), {
-      timeout: DECLARE_TIMEOUT,
+      timeout: CONNECT_TIMEOUT,
       clientProperties: { connection_name: `${name} (declare)` },
     });
     const conn = { model, error: null, closed: false };

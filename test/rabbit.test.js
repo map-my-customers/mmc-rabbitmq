@@ -4,6 +4,7 @@
 const { test } = require('node:test');
 const assert = require('node:assert/strict');
 const { execSync } = require('node:child_process');
+const net = require('node:net');
 const { monitorEventLoopDelay } = require('node:perf_hooks');
 const amqplib = require('amqplib');
 const { createRabbit, RetryLater } = require('..');
@@ -1361,3 +1362,76 @@ test('a declare connection that fails because close() started is not logged', as
   assert.deepEqual(errors.filter((line) => /declaring topology failed/.test(line)), []);
 });
 
+
+// A TCP proxy in front of the test broker. In 'blackhole' mode it accepts sockets and never answers them.
+async function proxy(t) {
+  const upstream = new globalThis.URL(URL);
+  const sockets = new Set();
+  const piped = new Set();
+  const front = { mode: 'pass' };
+  const server = net.createServer((client) => {
+    sockets.add(client);
+    client.on('error', () => {});
+    client.on('close', () => sockets.delete(client));
+    if (front.mode === 'blackhole') return;
+    const back = net.connect(Number(upstream.port) || 5672, upstream.hostname);
+    sockets.add(back);
+    piped.add(client).add(back);
+    back.on('error', () => client.destroy());
+    client.on('close', () => back.destroy());
+    back.on('close', () => {
+      sockets.delete(back);
+      client.destroy();
+    });
+    client.pipe(back).pipe(client);
+  });
+  await new Promise((resolve) => server.listen(0, '127.0.0.1', resolve));
+  t.after(() => {
+    sockets.forEach((socket) => socket.destroy());
+    server.close();
+  });
+  const url = new globalThis.URL(URL);
+  url.hostname = '127.0.0.1';
+  url.port = server.address().port;
+  front.url = url.toString();
+  front.dropPiped = () => {
+    piped.forEach((socket) => socket.destroy());
+    piped.clear();
+  };
+  return front;
+}
+
+const connectTimedOut = (warnings) => warnings.some((line) => /connect failed .*connect ETIMEDOUT/.test(line));
+
+test('a first connect to a broker that never answers times out and is retried', { timeout: 60_000 }, async (t) => {
+  const front = await proxy(t);
+  front.mode = 'blackhole';
+  const queue = queueName(t, 'first-connect-timeout');
+  const warnings = [];
+  const mq = rabbit(t, { url: front.url, log: { ...quiet, warn: (line) => warnings.push(line) } });
+  mq.declare(quorum(queue));
+  await mq.start();
+  await until(() => connectTimedOut(warnings), 30_000);
+  front.mode = 'pass';
+  await mq.ready(30_000);
+  await mq.sendToQueue(queue, 'after the timeout');
+  assert.equal(await depth(queue), 1);
+});
+
+test('a reconnect to a broker that never answers times out and recovers once it answers', { timeout: 60_000 }, async (t) => {
+  const front = await proxy(t);
+  const queue = queueName(t, 'reconnect-timeout');
+  const warnings = [];
+  const mq = rabbit(t, { url: front.url, log: { ...quiet, warn: (line) => warnings.push(line) } });
+  mq.declare(quorum(queue));
+  await mq.start();
+  await mq.ready(10_000);
+  assert.equal(connectTimedOut(warnings), false);
+  front.mode = 'blackhole';
+  front.dropPiped();
+  await until(() => connectTimedOut(warnings), 30_000);
+  front.mode = 'pass';
+  await mq.ready(30_000);
+  await mq.sendToQueue(queue, 'after the reconnect');
+  assert.equal(await depth(queue), 1);
+});
