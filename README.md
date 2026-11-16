@@ -144,6 +144,37 @@ a process that waits to exit on its own alive until the broker drops it or the h
 - `stats()` reports held publishes and their body bytes, in-flight handlers, whether publishing is blocked, and how
   many consumers are subscribed.
 
+### Health probes
+
+`rabbit.health()` returns `{ live: true, ready }`. `ready` is true while at least one consumer is registered, every
+consumer is subscribed, and `close()` has not started. Before any `consume()` it is false (`stats()` is then
+`consumers: 0, subscribed: 0`), so a service that only publishes is never ready; use `isReady()` for it.
+
+`createHealthServer(rabbit, { port = 8086, host })` serves it over HTTP for Kubernetes probes:
+
+```js
+const { createRabbit, createHealthServer } = require('mmc-rabbitmq');
+
+const mq = createRabbit({ url, name: 'worker' });
+mq.consume('jobs', handler, { prefetch: 10 });
+await mq.start();
+await createHealthServer(mq);
+```
+
+```yaml
+livenessProbe:  { httpGet: { path: /livez, port: 8086 } }
+readinessProbe: { httpGet: { path: /readyz, port: 8086 } }
+```
+
+- `/livez` is always 200 while the event loop answers. Never put broker state in a liveness probe: the library
+  reconnects by itself, and a restart during a broker outage only adds load when the broker returns.
+- `/readyz` is 200 when ready, else 503. It goes 503 as soon as `close()` starts.
+- Anything else is 404.
+
+The server does not keep the process alive, and `close()` closes it once the client has shut down (the returned
+`close()` can also be called earlier). A service that already runs its own HTTP server can skip this and answer from
+`rabbit.health()` in its own routes.
+
 Options: `heartbeat` (whole seconds from 0 to 65535, default 60), `maxHeldBytes` (default 64 MiB), `retryDelay` (`{ min, max }` in ms, default 1 s to
 30 s; used for reconnecting, re-subscribing and `RetryLater` backoff) and `log` (default `console`). `createRabbit`
 throws a `TypeError` for a value that is not a number in range, such as an unparsed environment variable.
