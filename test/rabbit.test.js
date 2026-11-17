@@ -5,6 +5,7 @@ const { test } = require('node:test');
 const assert = require('node:assert/strict');
 const { execSync, spawnSync } = require('node:child_process');
 const net = require('node:net');
+const { join } = require('node:path');
 const { monitorEventLoopDelay } = require('node:perf_hooks');
 const amqplib = require('amqplib');
 const { createRabbit, createHealthServer, RetryLater } = require('..');
@@ -1446,7 +1447,7 @@ async function healthServer(t, mq) {
 
 function runChild(body) {
   const script = `const { createRabbit, createHealthServer } = require(process.argv[1]); (async () => { ${body} })();`;
-  return spawnSync(process.execPath, ['-e', script, require('node:path').join(__dirname, '..'), NO_BROKER], { timeout: 20_000 });
+  return spawnSync(process.execPath, ['-e', script, join(__dirname, '..'), NO_BROKER], { timeout: 20_000 });
 }
 
 test('without a broker: readyz is 503 before any consumer, livez is 200, and an unknown path is 404', async (t) => {
@@ -1459,6 +1460,8 @@ test('without a broker: readyz is 503 before any consumer, livez is 200, and an 
   assert.equal(await status(health, '/livez'), 200);
   assert.equal(await status(health, '/readyz'), 503);
   assert.equal(await status(health, '/nope'), 404);
+  assert.equal(await status(health, '/livez?verbose'), 200);
+  assert.equal((await fetch(`http://127.0.0.1:${health.port}/livez`)).headers.get('connection'), 'close');
 });
 
 test('without a broker: with a consumer registered, livez stays 200 and readyz stays 503', async (t) => {
@@ -1478,6 +1481,28 @@ test('a health server port that is not a whole number from 0 to 65535 is a TypeE
   for (const port of [null, '8086', '', NaN, 1.5, -1, 65536]) {
     await assert.rejects(createHealthServer(fake, { port }), TypeError, `port ${String(port)}`);
   }
+});
+
+test('a health server port already in use rejects instead of crashing the process', async (t) => {
+  const fake = { health: () => ({ live: true, ready: true }) };
+  const first = await createHealthServer(fake, { port: 0, host: '127.0.0.1' });
+  t.after(() => first.close());
+  await assert.rejects(createHealthServer(fake, { port: first.port, host: '127.0.0.1' }), { code: 'EADDRINUSE' });
+});
+
+test('without a broker: close() does not wait for a health check connection that is still open', async (t) => {
+  const mq = noBroker(t);
+  const health = await healthServer(t, mq);
+  const sock = net.connect(health.port, '127.0.0.1');
+  sock.on('error', () => {});
+  await new Promise((resolve) => sock.once('connect', resolve));
+  sock.write('GET /readyz HTTP/1.1\r\nHost: x\r\n'); // headers not finished
+  let timer;
+  const stuck = new Promise((resolve) => (timer = setTimeout(resolve, 3000, 'still waiting')));
+  const outcome = await Promise.race([mq.close(200).then(() => 'closed'), stuck]);
+  clearTimeout(timer);
+  sock.destroy();
+  assert.equal(outcome, 'closed');
 });
 
 test('without a broker: close() closes the health server', async (t) => {

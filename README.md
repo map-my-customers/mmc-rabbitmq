@@ -144,7 +144,17 @@ a process that waits to exit on its own alive until the broker drops it or the h
 - `stats()` reports held publishes and their body bytes, in-flight handlers, whether publishing is blocked, and how
   many consumers are subscribed.
 
-### Health probes
+Options: `heartbeat` (whole seconds from 0 to 65535, default 60), `maxHeldBytes` (default 64 MiB), `retryDelay` (`{ min, max }` in ms, default 1 s to
+30 s; used for reconnecting, re-subscribing and `RetryLater` backoff) and `log` (default `console`). `createRabbit`
+throws a `TypeError` for a value that is not a number in range, such as an unparsed environment variable.
+`publishWithin(ms, …)` and `ready(ms)` reject with a `TypeError` unless `0 < ms <= 2147483647`. `close(graceMs)`
+returns within about that long (a few milliseconds over when every step has to wait); a missing or invalid value
+means 25 s.
+
+Each instance holds one publish connection, one consume connection once it has a consumer, and a short-lived
+declare connection while declarations run (after each publish reconnect, and for a `declare()` after `start()`).
+
+### Health probes (since v1.1.0)
 
 `rabbit.health()` returns `{ live: true, ready }`. `ready` is true while at least one consumer is registered, every
 consumer is subscribed, and `close()` has not started. Before any `consume()` it is false (`stats()` is then
@@ -174,18 +184,10 @@ readinessProbe: { httpGet: { path: /readyz, port: 8086 } }
 - Anything else is 404.
 
 The server does not keep the process alive, and `close()` closes it once the client has shut down (the returned
-`close()` can also be called earlier). A service that already runs its own HTTP server can skip this and answer from
-`rabbit.health()` in its own routes.
-
-Options: `heartbeat` (whole seconds from 0 to 65535, default 60), `maxHeldBytes` (default 64 MiB), `retryDelay` (`{ min, max }` in ms, default 1 s to
-30 s; used for reconnecting, re-subscribing and `RetryLater` backoff) and `log` (default `console`). `createRabbit`
-throws a `TypeError` for a value that is not a number in range, such as an unparsed environment variable.
-`publishWithin(ms, …)` and `ready(ms)` reject with a `TypeError` unless `0 < ms <= 2147483647`. `close(graceMs)`
-returns within about that long (a few milliseconds over when every step has to wait); a missing or invalid value
-means 25 s.
-
-Each instance holds one publish connection, one consume connection once it has a consumer, and a short-lived
-declare connection while declarations run (after each publish reconnect, and for a `declare()` after `start()`).
+`close()` can also be called earlier). Use `/readyz` (or `health().ready`) as readiness only for a pod that serves no
+traffic of its own. A pod that also serves HTTP should keep readiness on its own routes, and can report `rabbit.health()`
+on a separate path for monitoring; otherwise a broker outage takes every replica out of its Service, including routes
+that never touch the broker.
 
 ## Test
 
