@@ -1473,6 +1473,13 @@ test('without a broker: with a consumer registered, livez stays 200 and readyz s
   }
 });
 
+test('a health server port that is not a whole number from 0 to 65535 is a TypeError', async () => {
+  const fake = { health: () => ({ live: true, ready: true }) };
+  for (const port of [null, '8086', '', NaN, 1.5, -1, 65536]) {
+    await assert.rejects(createHealthServer(fake, { port }), TypeError, `port ${String(port)}`);
+  }
+});
+
 test('without a broker: close() closes the health server', async (t) => {
   const mq = noBroker(t);
   const health = await healthServer(t, mq);

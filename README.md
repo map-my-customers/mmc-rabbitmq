@@ -150,7 +150,9 @@ a process that waits to exit on its own alive until the broker drops it or the h
 consumer is subscribed, and `close()` has not started. Before any `consume()` it is false (`stats()` is then
 `consumers: 0, subscribed: 0`), so a service that only publishes is never ready; use `isReady()` for it.
 
-`createHealthServer(rabbit, { port = 8086, host })` serves it over HTTP for Kubernetes probes:
+`createHealthServer(rabbit, { port = 8086, host })` serves it over HTTP for Kubernetes probes. `port` must be a whole
+number from 0 to 65535 (0 picks a free port); anything else, such as an unparsed environment variable, rejects with a
+`TypeError`:
 
 ```js
 const { createRabbit, createHealthServer } = require('mmc-rabbitmq');

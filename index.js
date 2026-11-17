@@ -747,6 +747,10 @@ function createRabbit({
 }
 
 async function createHealthServer(rabbit, { port = 8086, host } = {}) {
+  // listen() takes null as 0, a random port, so the probes would never reach it.
+  if (!(Number.isInteger(port) && port >= 0 && port <= 65535)) {
+    throw new TypeError(`mmc-rabbitmq: health server port must be a whole number from 0 to 65535, got ${port}`);
+  }
   const server = http.createServer((req, res) => {
     const path = req.url.split('?')[0];
     // Liveness must not look at the broker: an outage would get the pod restarted for nothing.
