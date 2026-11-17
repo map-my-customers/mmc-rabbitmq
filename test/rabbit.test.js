@@ -3,11 +3,12 @@
 // Runs against a real broker: RABBIT_URL, and RABBIT_CONTAINER for the tests that run rabbitmqctl or docker stop/start.
 const { test } = require('node:test');
 const assert = require('node:assert/strict');
-const { execSync } = require('node:child_process');
+const { execSync, spawnSync } = require('node:child_process');
 const net = require('node:net');
+const { join } = require('node:path');
 const { monitorEventLoopDelay } = require('node:perf_hooks');
 const amqplib = require('amqplib');
-const { createRabbit, RetryLater } = require('..');
+const { createRabbit, createHealthServer, RetryLater } = require('..');
 
 const URL = process.env.RABBIT_URL || 'amqp://guest:guest@localhost:5672';
 const CONTAINER = process.env.RABBIT_CONTAINER || 'rabbit';
@@ -1434,4 +1435,153 @@ test('a reconnect to a broker that never answers times out and recovers once it 
   await mq.ready(30_000);
   await mq.sendToQueue(queue, 'after the reconnect');
   assert.equal(await depth(queue), 1);
+});
+
+const status = async (health, path) => (await fetch(`http://127.0.0.1:${health.port}${path}`)).status;
+
+async function healthServer(t, mq) {
+  const health = await createHealthServer(mq, { port: 0, host: '127.0.0.1' });
+  t.after(() => health.close());
+  return health;
+}
+
+function runChild(body) {
+  const script = `const { createRabbit, createHealthServer } = require(process.argv[1]); (async () => { ${body} })();`;
+  return spawnSync(process.execPath, ['-e', script, join(__dirname, '..'), NO_BROKER], { timeout: 20_000 });
+}
+
+test('without a broker: readyz is 503 before any consumer, livez is 200, and an unknown path is 404', async (t) => {
+  const mq = noBroker(t);
+  const health = await healthServer(t, mq);
+  assert.deepEqual(mq.health(), { live: true, ready: false });
+  assert.equal(mq.stats().consumers, 0);
+  assert.equal(mq.stats().subscribed, 0);
+  await mq.start();
+  assert.equal(await status(health, '/livez'), 200);
+  assert.equal(await status(health, '/readyz'), 503);
+  assert.equal(await status(health, '/nope'), 404);
+  assert.equal(await status(health, '/livez?verbose'), 200);
+  assert.equal((await fetch(`http://127.0.0.1:${health.port}/livez`)).headers.get('connection'), 'close');
+});
+
+test('without a broker: with a consumer registered, livez stays 200 and readyz stays 503', async (t) => {
+  const mq = noBroker(t);
+  mq.consume('q', () => {}, { prefetch: 1 });
+  const health = await healthServer(t, mq);
+  await mq.start();
+  for (let i = 0; i < 3; i++) {
+    assert.equal(await status(health, '/livez'), 200);
+    assert.equal(await status(health, '/readyz'), 503);
+    await sleep(300);
+  }
+});
+
+test('a health server port that is not a whole number from 0 to 65535 is a TypeError', async () => {
+  const fake = { health: () => ({ live: true, ready: true }) };
+  for (const port of [null, '8086', '', NaN, 1.5, -1, 65536]) {
+    await assert.rejects(createHealthServer(fake, { port }), TypeError, `port ${String(port)}`);
+  }
+});
+
+test('a health server port already in use rejects instead of crashing the process', async (t) => {
+  const fake = { health: () => ({ live: true, ready: true }) };
+  const first = await createHealthServer(fake, { port: 0, host: '127.0.0.1' });
+  t.after(() => first.close());
+  await assert.rejects(createHealthServer(fake, { port: first.port, host: '127.0.0.1' }), { code: 'EADDRINUSE' });
+});
+
+test('without a broker: close() does not wait for a health check connection that is still open', async (t) => {
+  const mq = noBroker(t);
+  const health = await healthServer(t, mq);
+  const sock = net.connect(health.port, '127.0.0.1');
+  sock.on('error', () => {});
+  await new Promise((resolve) => sock.once('connect', resolve));
+  sock.write('GET /readyz HTTP/1.1\r\nHost: x\r\n'); // headers not finished
+  let timer;
+  const stuck = new Promise((resolve) => (timer = setTimeout(resolve, 3000, 'still waiting')));
+  const outcome = await Promise.race([mq.close(200).then(() => 'closed'), stuck]);
+  clearTimeout(timer);
+  sock.destroy();
+  assert.equal(outcome, 'closed');
+});
+
+test('without a broker: close() closes the health server', async (t) => {
+  const mq = noBroker(t);
+  const health = await healthServer(t, mq);
+  await mq.close(200);
+  await assert.rejects(status(health, '/livez'));
+});
+
+test('without a broker: a process that closes the client exits on its own', { timeout: 30_000 }, () => {
+  const result = runChild(`
+    const mq = createRabbit({ url: process.argv[2], name: 'exit', log: { info() {}, warn() {}, error() {} } });
+    mq.consume('q', () => {}, { prefetch: 1 });
+    await mq.start();
+    const { port } = await createHealthServer(mq, { port: 0, host: '127.0.0.1' });
+    if ((await fetch('http://127.0.0.1:' + port + '/livez')).status !== 200) process.exit(2);
+    await mq.close(500);
+  `);
+  assert.equal(result.signal, null, 'the process had to be killed');
+  assert.equal(result.status, 0);
+});
+
+test('a health server alone does not keep a finished process alive', { timeout: 30_000 }, () => {
+  const result = runChild(`await createHealthServer({ health: () => ({ live: true, ready: true }) }, { port: 0 });`);
+  assert.equal(result.signal, null, 'the process had to be killed');
+  assert.equal(result.status, 0);
+});
+
+test('readyz is 200 once the consumer is subscribed', async (t) => {
+  const queue = queueName(t, 'readyz');
+  const mq = rabbit(t);
+  mq.declare(quorum(queue));
+  const health = await healthServer(t, mq);
+  await mq.start();
+  assert.equal(await status(health, '/readyz'), 503);
+  mq.consume(queue, async () => {}, { prefetch: 1 });
+  await until(async () => (await status(health, '/readyz')) === 200, 15_000);
+  assert.deepEqual(mq.health(), { live: true, ready: true });
+  assert.equal(await status(health, '/livez'), 200);
+});
+
+test('readyz follows a broker stop and start while livez stays 200', { timeout: 180_000 }, async (t) => {
+  const queue = queueName(t, 'readyz-restart');
+  const mq = rabbit(t);
+  mq.declare(quorum(queue));
+  mq.consume(queue, async () => {}, { prefetch: 1 });
+  const health = await healthServer(t, mq);
+  await mq.start();
+  await until(async () => (await status(health, '/readyz')) === 200, 15_000);
+  const live = [];
+  const readyz = async () => {
+    live.push(await status(health, '/livez'));
+    return status(health, '/readyz');
+  };
+  execSync(`docker stop ${CONTAINER}`, { stdio: 'ignore' });
+  t.after(() => execSync(`docker start ${CONTAINER}`, { stdio: 'ignore' }));
+  await until(async () => (await readyz()) === 503, 30_000);
+  execSync(`docker start ${CONTAINER}`, { stdio: 'ignore' });
+  await until(async () => (await readyz()) === 200, 90_000);
+  assert.ok(live.length > 1 && live.every((code) => code === 200), `livez answered ${live}`);
+});
+
+test('readyz is 503 as soon as close() starts, and the health server closes when it finishes', { timeout: 30_000 }, async (t) => {
+  const queue = queueName(t, 'readyz-close');
+  const mq = rabbit(t);
+  mq.declare(quorum(queue));
+  let release;
+  let handling;
+  const started = new Promise((resolve) => (handling = resolve));
+  mq.consume(queue, () => new Promise((done) => ((release = done), handling())), { prefetch: 1 });
+  const health = await healthServer(t, mq);
+  await mq.start();
+  await until(async () => (await status(health, '/readyz')) === 200, 15_000);
+  await mq.sendToQueue(queue, 'x');
+  await started;
+  const closing = mq.close(10_000);
+  assert.equal(await status(health, '/readyz'), 503);
+  assert.equal(await status(health, '/livez'), 200);
+  release();
+  await closing;
+  await assert.rejects(status(health, '/livez'));
 });

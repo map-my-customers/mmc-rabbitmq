@@ -1,6 +1,7 @@
 'use strict';
 
 const { randomUUID } = require('node:crypto');
+const http = require('node:http');
 const amqp = require('amqplib');
 
 class RetryLater extends Error {
@@ -25,6 +26,9 @@ const ON_ERROR = {
   reject: 'rejected (dead-lettered if the queue has a dead-letter exchange, otherwise dropped)',
   requeue: 'requeued',
 };
+
+// Per client, what to run once close() has finished: how a health server made for it shuts down with it.
+const closeHooks = new WeakMap();
 
 const describe = (err) => (err instanceof Error ? err.message || err.code || err.name : String(err));
 const quietClose = (ch) => Promise.resolve().then(() => ch.close()).catch(() => {});
@@ -94,6 +98,7 @@ function createRabbit({
   const readyWaiters = new Set();
   const idleWaiters = [];
   const closedChannels = new WeakSet();
+  const onClosed = new Set();
   let pub = null;
   let sub = null;
   let pubCh = null;
@@ -615,7 +620,7 @@ function createRabbit({
   function close(graceMs = 25_000) {
     // setTimeout turns NaN or Infinity into 1 ms, which would skip the drain.
     if (!(typeof graceMs === 'number' && graceMs >= 0)) graceMs = 25_000;
-    closing ??= shutdown(Math.min(graceMs, MAX_TIMEOUT));
+    closing ??= shutdown(Math.min(graceMs, MAX_TIMEOUT)).finally(() => Promise.all([...onClosed].map((fn) => fn())));
     return closing;
   }
 
@@ -651,10 +656,24 @@ function createRabbit({
     await within(Promise.allSettled(conns.map((conn) => conn.close())), leftToEnd());
   }
 
-  return {
+  const stats = () => ({
+    held: pending.size,
+    heldBytes,
+    inFlight: inFlight.size,
+    blocked: Boolean(pub?.blocked),
+    consumers: consumers.length,
+    subscribed: consumers.filter((c) => c.tag).length,
+  });
+
+  const rabbit = {
     start,
     close,
     isReady,
+    stats,
+    health() {
+      const { consumers: total, subscribed } = stats();
+      return { live: true, ready: !closing && total > 0 && subscribed >= total };
+    },
     declare(fn) {
       declarations.push(fn);
       if (pub?.model) runDeclarations();
@@ -722,15 +741,37 @@ function createRabbit({
         readyWaiters.add(waiter);
       });
     },
-    stats: () => ({
-      held: pending.size,
-      heldBytes,
-      inFlight: inFlight.size,
-      blocked: Boolean(pub?.blocked),
-      consumers: consumers.length,
-      subscribed: consumers.filter((c) => c.tag).length,
-    }),
   };
+  closeHooks.set(rabbit, onClosed);
+  return rabbit;
 }
 
-module.exports = { createRabbit, RetryLater };
+async function createHealthServer(rabbit, { port = 8086, host } = {}) {
+  // listen() takes null as 0, a random port, so the probes would never reach it.
+  if (!(Number.isInteger(port) && port >= 0 && port <= 65535)) {
+    throw new TypeError(`mmc-rabbitmq: health server port must be a whole number from 0 to 65535, got ${port}`);
+  }
+  const server = http.createServer((req, res) => {
+    const path = req.url.split('?')[0];
+    // Liveness must not look at the broker: an outage would get the pod restarted for nothing.
+    const status = path === '/livez' ? 200 : path === '/readyz' ? (rabbit.health().ready ? 200 : 503) : 404;
+    res.writeHead(status, { 'content-type': 'text/plain', connection: 'close' });
+    res.end(http.STATUS_CODES[status]);
+  });
+  await new Promise((resolve, reject) => {
+    server.once('error', reject);
+    server.listen(port, host, resolve);
+  });
+  server.unref();
+  let closed;
+  const close = () =>
+    (closed ??= new Promise((resolve) => {
+      closeHooks.get(rabbit)?.delete(close);
+      server.close(() => resolve());
+      server.closeAllConnections();
+    }));
+  closeHooks.get(rabbit)?.add(close);
+  return { port: server.address().port, close };
+}
+
+module.exports = { createRabbit, createHealthServer, RetryLater };
