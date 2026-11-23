@@ -160,9 +160,16 @@ declare connection while declarations run (after each publish reconnect, and for
 consumer is subscribed, and `close()` has not started. Before any `consume()` it is false (`stats()` is then
 `consumers: 0, subscribed: 0`), so a service that only publishes is never ready; use `isReady()` for it.
 
+`ready` looks only at the consumers. A broker alarm that blocks publishing leaves it true, while `isReady()` goes false
+and `stats().blocked` true: the alarm blocks every pod at once, so marking them unready would move no work and only
+stall rollouts. Publishes made meanwhile are held, up to `maxHeldBytes`.
+
 `createHealthServer(rabbit, { port = 8086, host })` serves it over HTTP for Kubernetes probes. `port` must be a whole
 number from 0 to 65535 (0 picks a free port); anything else, such as an unparsed environment variable, rejects with a
-`TypeError`:
+`TypeError`. Without `host` it listens on every interface, as `server.listen()` does; pass `host: '127.0.0.1'` to keep
+it local outside a pod. Each server reports one client, so a process with two clients needs a `port` for each (a
+second server on a port in use rejects with `EADDRINUSE`). An object passed in place of a client is not closed with any
+client; call the returned `close()` yourself:
 
 ```js
 const { createRabbit, createHealthServer } = require('mmc-rabbitmq');

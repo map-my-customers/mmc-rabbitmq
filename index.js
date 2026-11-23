@@ -516,6 +516,9 @@ function createRabbit({
           const { consumerTag } = await ch.consume(consumer.queue, (msg) => onMessage(consumer, ch, live.signal, msg));
           // close() only cancels subscriptions it can see; this one completed after it looked.
           if (closing) return void ch.cancel(consumerTag).catch(() => {});
+          // amqplib handles every frame of one socket read before this runs, so a channel.close that arrived with the
+          // consume-ok has already closed the channel and scheduled the retry.
+          if (consumer.ch !== ch) return;
           consumer.tag = consumerTag;
           consumer.delay = retryDelay.min;
         } catch (err) {

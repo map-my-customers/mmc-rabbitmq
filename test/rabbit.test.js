@@ -871,6 +871,36 @@ test('a dropped consume connection comes back with one subscription per consumer
   await mq.close(2000);
 });
 
+test('a channel the broker closes in the same read as its consume-ok is not counted as subscribed', async (t) => {
+  const queue = queueName(t, 'stale-tag');
+  const mq = rabbit(t, { retryDelay: { min: 2000, max: 2000 } });
+  mq.declare(quorum(queue));
+  // amqplib then runs the channel's close handlers before consume() resolves. The first consume() here holds its
+  // consume-ok until the broker has closed the channel (checkQueue of a missing queue is a 404 channel error).
+  const proto = await admin((ch) => Object.getPrototypeOf(Object.getPrototypeOf(ch)));
+  const original = proto.consume;
+  let closed;
+  proto.consume = async function (...args) {
+    proto.consume = original;
+    const ok = await original.apply(this, args);
+    closed = new Promise((resolve) => this.once('close', resolve));
+    this.checkQueue(`${queue}.missing`).catch(() => {});
+    await closed;
+    return ok;
+  };
+  t.after(() => (proto.consume = original));
+  mq.consume(queue, async () => {}, { prefetch: 1 });
+  await mq.start();
+  await until(() => closed !== undefined);
+  await closed;
+  await new Promise((resolve) => setImmediate(resolve));
+  assert.equal(mq.stats().subscribed, 0);
+  assert.equal(mq.health().ready, false);
+  // The retry subscribes on a new channel.
+  await until(() => mq.health().ready, 10_000);
+  assert.equal(await consumerCount(queue), 1);
+});
+
 test('a failed declaration is retried until it succeeds', async (t) => {
   const queue = queueName(t, 'bind-retry');
   const exchange = queueName(t, 'bind-retry-ex');
