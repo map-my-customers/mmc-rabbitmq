@@ -875,8 +875,8 @@ test('a channel the broker closes in the same read as its consume-ok is not coun
   const queue = queueName(t, 'stale-tag');
   const mq = rabbit(t, { retryDelay: { min: 2000, max: 2000 } });
   mq.declare(quorum(queue));
-  // amqplib then runs the channel's close handlers before consume() resolves. The first consume() here holds its
-  // consume-ok until the broker has closed the channel (checkQueue of a missing queue is a 404 channel error).
+  // amqplib then runs the channel's close handlers before an awaited consume() resumes. The first consume() here holds
+  // its consume-ok until the broker has closed the channel (checkQueue of a missing queue is a 404 channel error).
   const proto = await admin((ch) => Object.getPrototypeOf(Object.getPrototypeOf(ch)));
   const original = proto.consume;
   let closed;
@@ -1510,6 +1510,12 @@ test('a health server port that is not a whole number from 0 to 65535 is a TypeE
   const fake = { health: () => ({ live: true, ready: true }) };
   for (const port of [null, '8086', '', NaN, 1.5, -1, 65536]) {
     await assert.rejects(createHealthServer(fake, { port }), TypeError, `port ${String(port)}`);
+  }
+});
+
+test('a health server for something without a health() method is a TypeError', async () => {
+  for (const rabbit of [undefined, null, {}, { port: 8086 }, { health: true }]) {
+    await assert.rejects(createHealthServer(rabbit, { port: 0, host: '127.0.0.1' }), TypeError, JSON.stringify(rabbit));
   }
 });
 

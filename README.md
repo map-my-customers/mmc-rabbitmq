@@ -166,10 +166,8 @@ stall rollouts. Publishes made meanwhile are held, up to `maxHeldBytes`.
 
 `createHealthServer(rabbit, { port = 8086, host })` serves it over HTTP for Kubernetes probes. `port` must be a whole
 number from 0 to 65535 (0 picks a free port); anything else, such as an unparsed environment variable, rejects with a
-`TypeError`. Without `host` it listens on every interface, as `server.listen()` does; pass `host: '127.0.0.1'` to keep
-it local outside a pod. Each server reports one client, so a process with two clients needs a `port` for each (a
-second server on a port in use rejects with `EADDRINUSE`). An object passed in place of a client is not closed with any
-client; call the returned `close()` yourself:
+`TypeError`, as does a first argument without a `health()` method. Without `host` it listens on every interface, as
+`server.listen()` does; pass `host: '127.0.0.1'` to keep it local outside a pod:
 
 ```js
 const { createRabbit, createHealthServer } = require('mmc-rabbitmq');
@@ -195,6 +193,18 @@ The server does not keep the process alive, and `close()` closes it once the cli
 traffic of its own. A pod that also serves HTTP should keep readiness on its own routes, and can report `rabbit.health()`
 on a separate path for monitoring; otherwise a broker outage takes every replica out of its Service, including routes
 that never touch the broker.
+
+Each server reports one object, and a second server on a port in use rejects with `EADDRINUSE`. A container has one
+readiness probe, so a process with two clients serves one object that combines them. Only a client closes its server
+when it closes; for anything else, call the returned `close()`:
+
+```js
+const health = await createHealthServer({
+  health: () => ({ live: true, ready: a.health().ready && b.health().ready }),
+});
+// after a.close() and b.close():
+await health.close();
+```
 
 ## Test
 

@@ -61,7 +61,10 @@ export interface HealthServer {
   close(): Promise<void>;
 }
 
-/** Serves GET /livez (always 200) and /readyz (200 when `health().ready`, else 503). Closes with the client. */
+/**
+ * Serves GET /livez (always 200) and /readyz (200 when `health().ready`, else 503). Closes with the client passed in;
+ * for any other object with `health()`, call the returned `close()`.
+ */
 export function createHealthServer(
   rabbit: Pick<Rabbit, 'health'>,
   options?: { port?: number; host?: string },
