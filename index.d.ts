@@ -41,6 +41,8 @@ export interface Rabbit {
   sendToQueue(queue: string, body: Body, options?: Options.Publish): Promise<void>;
   publishWithin(ms: number, exchange: string, routingKey: string, body: Body, options?: Options.Publish): Promise<void>;
   isReady(): boolean;
+  /** `ready` is true while at least one consumer is registered, all of them are subscribed, and close() has not started. */
+  health(): { live: true; ready: boolean };
   stats(): {
     held: number;
     /** Body bytes only; the hold cap also counts 1536 bytes per held publish. */
@@ -53,4 +55,18 @@ export interface Rabbit {
 }
 
 export function createRabbit(options: RabbitOptions): Rabbit;
+
+export interface HealthServer {
+  port: number;
+  close(): Promise<void>;
+}
+
+/**
+ * Serves GET /livez (always 200) and /readyz (200 when `health().ready`, else 503). Closes with the client passed in;
+ * for any other object with `health()`, call the returned `close()`.
+ */
+export function createHealthServer(
+  rabbit: Pick<Rabbit, 'health'>,
+  options?: { port?: number; host?: string },
+): Promise<HealthServer>;
 export type { Channel };

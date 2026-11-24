@@ -154,6 +154,59 @@ means 25 s.
 Each instance holds one publish connection, one consume connection once it has a consumer, and a short-lived
 declare connection while declarations run (after each publish reconnect, and for a `declare()` after `start()`).
 
+### Health probes (since v1.1.0)
+
+`rabbit.health()` returns `{ live: true, ready }`. `ready` is true while at least one consumer is registered, every
+consumer is subscribed, and `close()` has not started. Before any `consume()` it is false (`stats()` is then
+`consumers: 0, subscribed: 0`), so a service that only publishes is never ready; use `isReady()` for it.
+
+`ready` looks only at the consumers. A broker alarm that blocks publishing leaves it true, while `isReady()` goes false
+and `stats().blocked` true: the alarm blocks every pod at once, so marking them unready would move no work and only
+stall rollouts. Publishes made meanwhile are held, up to `maxHeldBytes`.
+
+`createHealthServer(rabbit, { port = 8086, host })` serves it over HTTP for Kubernetes probes. `port` must be a whole
+number from 0 to 65535 (0 picks a free port); anything else, such as an unparsed environment variable, rejects with a
+`TypeError`, as does a first argument without a `health()` method. Without `host` it listens on every interface, as
+`server.listen()` does; pass `host: '127.0.0.1'` to keep it local outside a pod:
+
+```js
+const { createRabbit, createHealthServer } = require('mmc-rabbitmq');
+
+const mq = createRabbit({ url, name: 'worker' });
+mq.consume('jobs', handler, { prefetch: 10 });
+await mq.start();
+await createHealthServer(mq);
+```
+
+```yaml
+livenessProbe:  { httpGet: { path: /livez, port: 8086 } }
+readinessProbe: { httpGet: { path: /readyz, port: 8086 } }
+```
+
+- `/livez` is always 200 while the event loop answers. Never put broker state in a liveness probe: the library
+  reconnects by itself, and a restart during a broker outage only adds load when the broker returns.
+- `/readyz` is 200 when ready, else 503. It goes 503 as soon as `close()` starts.
+- Anything else is 404.
+
+The server does not keep the process alive, and `close()` closes it once the client has shut down (the returned
+`close()` can also be called earlier). Use `/readyz` (or `health().ready`) as readiness only for a pod that serves no
+traffic of its own. A pod that also serves HTTP should keep readiness on its own routes, and can report `rabbit.health()`
+on a separate path for monitoring; otherwise a broker outage takes every replica out of its Service, including routes
+that never touch the broker.
+
+Each server reports one object, and a second server on a port in use rejects with `EADDRINUSE`. A container has one
+readiness probe, so a process with two clients serves one object that combines the clients that consume (a client that
+only publishes is never ready, so leave it out). Only a client closes its server when it closes; for anything else,
+call the returned `close()`:
+
+```js
+const health = await createHealthServer({
+  health: () => ({ live: true, ready: a.health().ready && b.health().ready }),
+});
+// after a.close() and b.close():
+await health.close();
+```
+
 ## Test
 
 The tests need a broker. With Docker:
