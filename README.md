@@ -195,8 +195,9 @@ on a separate path for monitoring; otherwise a broker outage takes every replica
 that never touch the broker.
 
 Each server reports one object, and a second server on a port in use rejects with `EADDRINUSE`. A container has one
-readiness probe, so a process with two clients serves one object that combines them. Only a client closes its server
-when it closes; for anything else, call the returned `close()`:
+readiness probe, so a process with two clients serves one object that combines the clients that consume (a client that
+only publishes is never ready, so leave it out). Only a client closes its server when it closes; for anything else,
+call the returned `close()`:
 
 ```js
 const health = await createHealthServer({
