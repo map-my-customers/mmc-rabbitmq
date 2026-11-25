@@ -153,19 +153,39 @@ test('RetryLater retries in place and acks once', async (t) => {
 
 test('other handler errors, including non-Error throws, reject the message and the consumer carries on', async (t) => {
   const queue = queueName(t, 'poison');
-  const mq = rabbit(t);
+  const errors = [];
+  const mq = rabbit(t, { log: { ...quiet, error: (line) => errors.push(line) } });
   const dlq = withDeadLetters(t, mq, queue);
   const good = [];
+  const calls = {};
   mq.consume(queue, async (msg) => {
     const body = String(msg.content);
+    calls[body] = (calls[body] ?? 0) + 1;
     if (body === 'bad') throw new Error('bad payload');
     if (body === 'worse') throw undefined; // eslint-disable-line no-throw-literal
+    // String() cannot convert these, and instanceof throws for a revoked Proxy.
+    if (body === 'bare') throw Object.create(null);
+    if (body === 'symbol') {
+      const err = new Error('x');
+      err.message = Symbol('odd');
+      throw err;
+    }
+    if (body === 'revoked') {
+      const { proxy, revoke } = Proxy.revocable({}, {});
+      revoke();
+      throw proxy;
+    }
     good.push(body);
   }, { prefetch: 1 });
   await mq.start();
-  for (const body of ['bad', 'worse', 'good']) await mq.sendToQueue(queue, body);
-  await until(async () => good.length === 1 && (await depth(dlq)) === 2);
+  const bodies = ['bad', 'worse', 'bare', 'symbol', 'revoked', 'good'];
+  for (const body of bodies) await mq.sendToQueue(queue, body);
+  await until(async () => good.length === 1 && (await depth(dlq)) === 5);
   await mq.close(2000);
+  // Each failed message is handled once and rejected, not put back in a loop.
+  assert.deepEqual(calls, Object.fromEntries(bodies.map((body) => [body, 1])));
+  assert.match(errors.join('\n'), /handler failed, rejected .*: Symbol\(odd\)/);
+  assert.match(errors.join('\n'), /handler failed, rejected .*: an unprintable value/);
 });
 
 test('onError: requeue puts a failed message back for another try', async (t) => {
@@ -1531,7 +1551,9 @@ test('a health() that throws or has no boolean ready answers 503 and logs once',
       () => { throw Object.create(null); },
       () => { const err = new Error('x'); err.message = Object.create(null); throw err; },
       () => { const err = new Error('x'); err.message = Symbol('odd'); throw err; },
-      () => ({ then: () => { thenCalls += 1; } }),
+      () => ({ then: () => { thenCalls += 1; }, catch: () => { thenCalls += 1; } }),
+      () => { const { proxy, revoke } = Proxy.revocable({}, {}); revoke(); throw proxy; },
+      () => require('node:vm').runInNewContext('Promise.reject(new Error("from another realm"))'),
     ];
     let thenCalls = 0;
     for (const health of shapes) {
@@ -1540,17 +1562,21 @@ test('a health() that throws or has no boolean ready answers 503 and logs once',
       console.log([await get('/readyz'), await get('/readyz'), await get('/livez')].join(','));
       await server.close();
     }
-    console.log('then() calls: ' + thenCalls);
+    console.log('then() and catch() calls: ' + thenCalls);
   `);
   assert.equal(result.status, 0, String(result.stderr));
   // /readyz answers 503 on every probe while /livez stays 200, and a thenable that is not a promise is never run.
-  assert.deepEqual(String(result.stdout).trim().split('\n'), [...Array(10).fill('503,503,200'), 'then() calls: 0']);
+  assert.deepEqual(String(result.stdout).trim().split('\n'), [...Array(12).fill('503,503,200'), 'then() and catch() calls: 0']);
   // One line per server, not one per probe.
   const lines = String(result.stderr).split('\n').filter((line) => line.startsWith('mmc-rabbitmq: health()'));
-  assert.equal(lines.length, 10, lines.join('\n'));
+  assert.equal(lines.length, 12, lines.join('\n'));
   assert.match(lines[0], /threw: boom/);
   assert.match(lines[3], /got a promise/);
+  assert.match(lines[6], /threw: \[object Object\]/);
+  assert.match(lines[7], /threw: \[object Error\]/);
   assert.match(lines[8], /threw: Symbol\(odd\)/);
+  assert.match(lines[10], /threw: an unprintable value/);
+  assert.match(lines[11], /got a promise/);
 });
 
 test('a health server survives errors after it is listening', { timeout: 30_000 }, () => {

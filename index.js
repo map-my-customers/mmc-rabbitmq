@@ -2,6 +2,7 @@
 
 const { randomUUID } = require('node:crypto');
 const http = require('node:http');
+const { types } = require('node:util');
 const amqp = require('amqplib');
 
 class RetryLater extends Error {
@@ -42,6 +43,14 @@ const describe = (err) => {
     } catch {
       return 'an unprintable value';
     }
+  }
+};
+// instanceof reads the value's prototype, which a revoked Proxy refuses, so it can throw too.
+const isRetryLater = (err) => {
+  try {
+    return err instanceof RetryLater;
+  } catch {
+    return false;
   }
 };
 const quietClose = (ch) => Promise.resolve().then(() => ch.close()).catch(() => {});
@@ -583,11 +592,12 @@ function createRabbit({
           await handler(msg, { signal });
           return settle(ch, msg, 'ack');
         } catch (err) {
+          const retryLater = isRetryLater(err);
           // Includes the RetryLater that close() gives publishes it could not send: the handler did nothing wrong.
-          if (err instanceof RetryLater && gone()) return settle(ch, msg, 'requeue');
+          if (retryLater && gone()) return settle(ch, msg, 'requeue');
           const exhausted = attempt >= retryLimit.attempts || Date.now() - firstTry + delay > retryLimit.ms;
-          if (!(err instanceof RetryLater) || exhausted) {
-            const retried = err instanceof RetryLater ? ` after ${attempt} attempts` : '';
+          if (!retryLater || exhausted) {
+            const retried = retryLater ? ` after ${attempt} attempts` : '';
             log.error(`mmc-rabbitmq: ${queue} handler failed${retried}, ${ON_ERROR[onError]}: ${describe(err)}`);
             return settle(ch, msg, onError);
           }
@@ -786,9 +796,10 @@ async function createHealthServer(rabbit, { port = 8086, host } = {}) {
         got = String(health);
       } else if (typeof health.then === 'function') {
         got = 'a promise';
-        // Nothing awaits it, so a rejection would be unhandled and take the process down. Only a native promise gets
-        // a handler: then() on another thenable, such as a query builder, can start its work on every probe.
-        if (health instanceof Promise) health.catch(() => {});
+        // Nothing awaits it, so a rejection would be unhandled and take the process down. Only a native promise, from
+        // any realm, gets a handler: then() on another thenable, such as a query builder, can start its work on every
+        // probe.
+        if (types.isPromise(health)) health.catch(() => {});
       }
       problem = `must return { ready: boolean }, got ${got}`;
     } catch (err) {
