@@ -191,13 +191,14 @@ readinessProbe:
 
 - `/livez` is always 200 while the event loop answers. Never put broker state in a liveness probe: the library
   reconnects by itself, and a restart during a broker outage only adds load when the broker returns. With
-  Kubernetes' defaults (a 1 s timeout, three failures 10 s apart), a handler that keeps the event loop busy for about
-  20 s gets the pod restarted; the settings above allow at least two minutes.
+  Kubernetes' defaults (a 1 s timeout, three failures 10 s apart), a handler that keeps the event loop busy for 20 to
+  30 s gets the pod restarted; the settings above allow at least two minutes.
 - `/readyz` is 200 when ready, else 503. It goes 503 as soon as `close()` starts. A broker that stops answering without
   closing the connection is noticed by the heartbeat after two to three intervals (2 to 3 minutes at the default 60 s);
-  `/readyz` stays 200 until then. A node cut off from its cluster's majority is not caught by the heartbeat either
-  when the cluster uses Khepri (the default for new clusters since RabbitMQ 4.2). The node keeps the connection open,
-  a consumer already subscribed there receives nothing, and `/readyz` stays 200 until the majority returns.
+  `/readyz` stays 200 until then. A node cut off from its cluster's majority is not caught by the heartbeat either,
+  unless it pauses (Mnesia with `pause_minority`); Khepri, the default for new clusters since RabbitMQ 4.2, has no
+  pause mode. The node keeps the connection open, a quorum-queue consumer there receives nothing, and `/readyz` stays
+  200 until the majority returns.
 - Anything else is 404.
 
 The server does not keep the process alive, and `close()` closes it once the client has shut down (the returned

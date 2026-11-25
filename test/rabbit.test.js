@@ -1529,21 +1529,28 @@ test('a health() that throws or has no boolean ready answers 503 and logs once',
       () => ({ live: true, ready: 'false' }),
       async () => { throw new Error('rejected'); },
       () => { throw Object.create(null); },
+      () => { const err = new Error('x'); err.message = Object.create(null); throw err; },
+      () => { const err = new Error('x'); err.message = Symbol('odd'); throw err; },
+      () => ({ then: () => { thenCalls += 1; } }),
     ];
+    let thenCalls = 0;
     for (const health of shapes) {
       const server = await createHealthServer({ health }, { port: 0, host: '127.0.0.1' });
       const get = async (path) => (await fetch('http://127.0.0.1:' + server.port + path)).status;
       console.log([await get('/readyz'), await get('/readyz'), await get('/livez')].join(','));
       await server.close();
     }
+    console.log('then() calls: ' + thenCalls);
   `);
   assert.equal(result.status, 0, String(result.stderr));
-  assert.deepEqual(String(result.stdout).trim().split('\n'), Array(7).fill('503,503,200'));
+  // /readyz answers 503 on every probe while /livez stays 200, and a thenable that is not a promise is never run.
+  assert.deepEqual(String(result.stdout).trim().split('\n'), [...Array(10).fill('503,503,200'), 'then() calls: 0']);
   // One line per server, not one per probe.
   const lines = String(result.stderr).split('\n').filter((line) => line.startsWith('mmc-rabbitmq: health()'));
-  assert.equal(lines.length, 7, lines.join('\n'));
+  assert.equal(lines.length, 10, lines.join('\n'));
   assert.match(lines[0], /threw: boom/);
   assert.match(lines[3], /got a promise/);
+  assert.match(lines[8], /threw: Symbol\(odd\)/);
 });
 
 test('a health server survives errors after it is listening', { timeout: 30_000 }, () => {
@@ -1591,6 +1598,32 @@ test('without a broker: a health server made after close() has finished is close
   const health = await createHealthServer(mq, { port: 0, host: '127.0.0.1' });
   t.after(() => health.close());
   await assert.rejects(status(health, '/livez'));
+});
+
+test('without a broker: a server made while close() is closing another is closed too', { timeout: 30_000 }, () => {
+  const result = runChild(`
+    const http = require('node:http');
+    const close = http.Server.prototype.close;
+    // Hold every server's close callback, so the second server is made while close() is still closing the first.
+    let release;
+    const held = new Promise((resolve) => (release = resolve));
+    let closingFirst = false;
+    http.Server.prototype.close = function (cb) {
+      closingFirst = true;
+      return close.call(this, (...args) => held.then(() => cb?.(...args)));
+    };
+    const mq = createRabbit({ url: process.argv[2], name: 'close-race', log: { info() {}, warn() {}, error() {} } });
+    await createHealthServer(mq, { port: 0, host: '127.0.0.1' });
+    const closed = mq.close(200);
+    while (!closingFirst) await new Promise((resolve) => setImmediate(resolve));
+    const second = await createHealthServer(mq, { port: 0, host: '127.0.0.1' });
+    const open = await fetch('http://127.0.0.1:' + second.port + '/livez').then(() => true, () => false);
+    release();
+    await closed;
+    console.log('second server open: ' + open);
+  `);
+  assert.equal(result.status, 0, String(result.stderr));
+  assert.equal(String(result.stdout).trim(), 'second server open: false');
 });
 
 test('without a broker: close() closes the health server', async (t) => {

@@ -32,11 +32,16 @@ const ON_ERROR = {
 const closeHooks = new WeakMap();
 
 const describe = (err) => {
-  // String() throws for an object without a usable toString(); describing an error must not raise another.
+  // Describing an error must not raise another. An Error's message need not be a string, and String() throws for a
+  // value without a usable toString() (a null-prototype object); Object.prototype.toString throws for a revoked Proxy.
   try {
-    return err instanceof Error ? err.message || err.code || err.name : String(err);
+    return String(err instanceof Error ? err.message || err.code || err.name : err);
   } catch {
-    return Object.prototype.toString.call(err);
+    try {
+      return Object.prototype.toString.call(err);
+    } catch {
+      return 'an unprintable value';
+    }
   }
 };
 const quietClose = (ch) => Promise.resolve().then(() => ch.close()).catch(() => {});
@@ -781,8 +786,9 @@ async function createHealthServer(rabbit, { port = 8086, host } = {}) {
         got = String(health);
       } else if (typeof health.then === 'function') {
         got = 'a promise';
-        // Nothing awaits it, so a rejection would be unhandled and take the process down.
-        Promise.resolve(health).catch(() => {});
+        // Nothing awaits it, so a rejection would be unhandled and take the process down. Only a native promise gets
+        // a handler: then() on another thenable, such as a query builder, can start its work on every probe.
+        if (health instanceof Promise) health.catch(() => {});
       }
       problem = `must return { ready: boolean }, got ${got}`;
     } catch (err) {
