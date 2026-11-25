@@ -758,10 +758,28 @@ async function createHealthServer(rabbit, { port = 8086, host } = {}) {
   if (!(Number.isInteger(port) && port >= 0 && port <= 65535)) {
     throw new TypeError(`mmc-rabbitmq: health server port must be a whole number from 0 to 65535, got ${port}`);
   }
+  let reported = false;
+  const ready = () => {
+    // A health() written by hand can throw or return the wrong shape: answer 503 and log once instead of crashing.
+    let problem;
+    try {
+      const health = rabbit.health();
+      if (typeof health?.ready === 'boolean') return health.ready;
+      let got = `ready of type ${typeof health?.ready}`;
+      if (health == null) got = String(health);
+      else if (typeof health.then === 'function') got = 'a promise';
+      problem = `must return { ready: boolean }, got ${got}`;
+    } catch (err) {
+      problem = `threw: ${describe(err)}`;
+    }
+    if (!reported) console.error(`mmc-rabbitmq: health() ${problem}; /readyz answers 503`);
+    reported = true;
+    return false;
+  };
   const server = http.createServer((req, res) => {
     const path = req.url.split('?')[0];
     // Liveness must not look at the broker: an outage would get the pod restarted for nothing.
-    const status = path === '/livez' ? 200 : path === '/readyz' ? (rabbit.health().ready ? 200 : 503) : 404;
+    const status = path === '/livez' ? 200 : path === '/readyz' ? (ready() ? 200 : 503) : 404;
     res.writeHead(status, { 'content-type': 'text/plain', connection: 'close' });
     res.end(http.STATUS_CODES[status]);
   });
@@ -769,6 +787,9 @@ async function createHealthServer(rabbit, { port = 8086, host } = {}) {
     server.once('error', reject);
     server.listen(port, host, resolve);
   });
+  // A failed accept() emits 'error' too. The once() listener above takes only the first, and an 'error' with no
+  // listener takes the process down.
+  server.on('error', (err) => console.error(`mmc-rabbitmq: health server error: ${describe(err)}`));
   server.unref();
   let closed;
   const close = () =>

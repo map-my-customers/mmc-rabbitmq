@@ -1519,6 +1519,48 @@ test('a health server for something without a health() method is a TypeError', a
   }
 });
 
+test('a health() that throws or has no boolean ready answers 503 and logs once', { timeout: 30_000 }, () => {
+  const result = runChild(`
+    const shapes = [
+      () => { throw new Error('boom'); },
+      () => undefined,
+      () => null,
+      async () => ({ live: true, ready: true }),
+      () => ({ live: true, ready: 'false' }),
+    ];
+    for (const health of shapes) {
+      const server = await createHealthServer({ health }, { port: 0, host: '127.0.0.1' });
+      const get = async (path) => (await fetch('http://127.0.0.1:' + server.port + path)).status;
+      console.log([await get('/readyz'), await get('/readyz'), await get('/livez')].join(','));
+      await server.close();
+    }
+  `);
+  assert.equal(result.status, 0, String(result.stderr));
+  assert.deepEqual(String(result.stdout).trim().split('\n'), Array(5).fill('503,503,200'));
+  // One line per server, not one per probe.
+  const lines = String(result.stderr).split('\n').filter((line) => line.startsWith('mmc-rabbitmq: health()'));
+  assert.equal(lines.length, 5, lines.join('\n'));
+  assert.match(lines[0], /threw: boom/);
+  assert.match(lines[3], /got a promise/);
+});
+
+test('a health server survives errors after it is listening', { timeout: 30_000 }, () => {
+  const result = runChild(`
+    const http = require('node:http');
+    const createServer = http.createServer;
+    let server;
+    http.createServer = (...args) => (server = createServer(...args));
+    const health = await createHealthServer({ health: () => ({ live: true, ready: true }) }, { port: 0, host: '127.0.0.1' });
+    // What net.Server emits when accept() fails, for example with ENOBUFS.
+    for (let i = 0; i < 2; i++) {
+      server.emit('error', Object.assign(new Error('accept ENOBUFS'), { code: 'ENOBUFS' }));
+    }
+    if ((await fetch('http://127.0.0.1:' + health.port + '/livez')).status !== 200) process.exit(2);
+    await health.close();
+  `);
+  assert.equal(result.status, 0, String(result.stderr));
+});
+
 test('a health server port already in use rejects instead of crashing the process', async (t) => {
   const fake = { health: () => ({ live: true, ready: true }) };
   const first = await createHealthServer(fake, { port: 0, host: '127.0.0.1' });

@@ -66,7 +66,7 @@ export interface HealthServer {
  * for any other object with `health()`, call the returned `close()`.
  */
 export function createHealthServer(
-  rabbit: Pick<Rabbit, 'health'>,
+  rabbit: { health(): { ready: boolean } },
   options?: { port?: number; host?: string },
 ): Promise<HealthServer>;
 export type { Channel };

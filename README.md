@@ -160,9 +160,10 @@ declare connection while declarations run (after each publish reconnect, and for
 consumer is subscribed, and `close()` has not started. Before any `consume()` it is false (`stats()` is then
 `consumers: 0, subscribed: 0`), so a service that only publishes is never ready; use `isReady()` for it.
 
-`ready` looks only at the consumers. A broker alarm that blocks publishing leaves it true, while `isReady()` goes false
-and `stats().blocked` true: the alarm blocks every pod at once, so marking them unready would move no work and only
-stall rollouts. Publishes made meanwhile are held, up to `maxHeldBytes`.
+`ready` looks only at the consumers, so a broker alarm that blocks publishing leaves it true. The broker blocks a
+connection once it publishes during the alarm; `isReady()` then goes false and `stats().blocked` true. The alarm blocks
+every pod at once, so marking them unready would move no work and only stall rollouts. Publishes made meanwhile are
+held, up to `maxHeldBytes`.
 
 `createHealthServer(rabbit, { port = 8086, host })` serves it over HTTP for Kubernetes probes. `port` must be a whole
 number from 0 to 65535 (0 picks a free port); anything else, such as an unparsed environment variable, rejects with a
@@ -185,7 +186,9 @@ readinessProbe: { httpGet: { path: /readyz, port: 8086 } }
 
 - `/livez` is always 200 while the event loop answers. Never put broker state in a liveness probe: the library
   reconnects by itself, and a restart during a broker outage only adds load when the broker returns.
-- `/readyz` is 200 when ready, else 503. It goes 503 as soon as `close()` starts.
+- `/readyz` is 200 when ready, else 503. It goes 503 as soon as `close()` starts. A broker that stops answering without
+  closing the connection is noticed by the heartbeat after two to three intervals (2 to 3 minutes at the default 60 s);
+  `/readyz` stays 200 until then.
 - Anything else is 404.
 
 The server does not keep the process alive, and `close()` closes it once the client has shut down (the returned
@@ -206,6 +209,9 @@ const health = await createHealthServer({
 // after a.close() and b.close():
 await health.close();
 ```
+
+`health()` must return `{ ready: boolean }` without waiting. If it throws, or returns anything else (a promise,
+nothing), `/readyz` answers 503 and the server logs one line with `console.error`.
 
 ## Test
 
