@@ -797,9 +797,14 @@ async function createHealthServer(rabbit, { port = 8086, host } = {}) {
       } else if (typeof health.then === 'function') {
         got = 'a promise';
         // Nothing awaits it, so a rejection would be unhandled and take the process down. Only a native promise, from
-        // any realm, gets a handler: then() on another thenable, such as a query builder, can start its work on every
-        // probe.
-        if (types.isPromise(health)) health.catch(() => {});
+        // any realm, gets a handler, through Promise.prototype.then: its own then() or catch(), as on a lazy promise
+        // subclass or a query builder, can start work on every probe. That then() builds its result with the
+        // subclass's constructor, which can refuse (p-lazy's does); the probe still answers 503.
+        if (types.isPromise(health)) {
+          try {
+            Promise.prototype.then.call(health, undefined, () => {});
+          } catch {}
+        }
       }
       problem = `must return { ready: boolean }, got ${got}`;
     } catch (err) {

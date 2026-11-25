@@ -197,9 +197,10 @@ readinessProbe:
 - `/readyz` is 200 when ready, else 503. It goes 503 as soon as `close()` starts. A broker that stops answering without
   closing the connection is noticed by the heartbeat after two to three intervals (2 to 3 minutes at the default 60 s);
   `/readyz` stays 200 until then. A node cut off from its cluster's majority keeps its connections open, so the
-  heartbeat does not notice it either. Only a node that pauses closes them (Mnesia with `pause_minority`); Khepri, the
-  default metadata store for new clusters from RabbitMQ 4.2 and the only one from 4.3, has no pause mode. A
-  quorum-queue consumer on such a node receives nothing, and `/readyz` stays 200 until the majority returns.
+  heartbeat does not notice it either. Only a node that pauses closes them (Mnesia with `pause_minority` or
+  `pause_if_all_down`); Khepri, the default metadata store for new clusters from RabbitMQ 4.2 and the only one from
+  4.3, has no pause mode. A quorum-queue consumer on such a node receives nothing, and `/readyz` stays 200 until the
+  majority returns.
 - Anything else is 404.
 
 The server does not keep the process alive, and `close()` closes it once the client has shut down (the returned

@@ -1541,6 +1541,17 @@ test('a health server for something without a health() method is a TypeError', a
 
 test('a health() that throws or has no boolean ready answers 503 and logs once', { timeout: 30_000 }, () => {
   const result = runChild(`
+    // A promise subclass with its own then() and catch().
+    class Counted extends Promise {
+      then(a, b) { thenCalls += 1; return super.then(a, b); }
+      catch(b) { thenCalls += 1; return super.catch(b); }
+    }
+    // p-lazy's shape: the constructor ignores the executor it is given, and then() or catch() starts the work.
+    class Lazy extends Promise {
+      constructor(executor) { super((resolve) => resolve()); this.executor = executor; }
+      then(a, b) { thenCalls += 1; return new Promise(this.executor).then(a, b); }
+      catch(b) { thenCalls += 1; return new Promise(this.executor).catch(b); }
+    }
     const shapes = [
       () => { throw new Error('boom'); },
       () => undefined,
@@ -1554,6 +1565,10 @@ test('a health() that throws or has no boolean ready answers 503 and logs once',
       () => ({ then: () => { thenCalls += 1; }, catch: () => { thenCalls += 1; } }),
       () => { const { proxy, revoke } = Proxy.revocable({}, {}); revoke(); throw proxy; },
       () => require('node:vm').runInNewContext('Promise.reject(new Error("from another realm"))'),
+      () => Counted.reject(new Error('subclass')),
+      () => new Lazy((_, reject) => reject(new Error('lazy'))),
+      () => { const p = Promise.reject(new Error('own catch')); p.catch = () => { thenCalls += 1; }; return p; },
+      () => { throw new Proxy(new Error('x'), { get() { throw new Error('trap'); } }); },
     ];
     let thenCalls = 0;
     for (const health of shapes) {
@@ -1565,11 +1580,11 @@ test('a health() that throws or has no boolean ready answers 503 and logs once',
     console.log('then() and catch() calls: ' + thenCalls);
   `);
   assert.equal(result.status, 0, String(result.stderr));
-  // /readyz answers 503 on every probe while /livez stays 200, and a thenable that is not a promise is never run.
-  assert.deepEqual(String(result.stdout).trim().split('\n'), [...Array(12).fill('503,503,200'), 'then() and catch() calls: 0']);
+  // /readyz answers 503 on every probe while /livez stays 200, and no then() or catch() of the value's own is called.
+  assert.deepEqual(String(result.stdout).trim().split('\n'), [...Array(16).fill('503,503,200'), 'then() and catch() calls: 0']);
   // One line per server, not one per probe.
   const lines = String(result.stderr).split('\n').filter((line) => line.startsWith('mmc-rabbitmq: health()'));
-  assert.equal(lines.length, 12, lines.join('\n'));
+  assert.equal(lines.length, 16, lines.join('\n'));
   assert.match(lines[0], /threw: boom/);
   assert.match(lines[3], /got a promise/);
   assert.match(lines[6], /threw: \[object Object\]/);
@@ -1577,6 +1592,10 @@ test('a health() that throws or has no boolean ready answers 503 and logs once',
   assert.match(lines[8], /threw: Symbol\(odd\)/);
   assert.match(lines[10], /threw: an unprintable value/);
   assert.match(lines[11], /got a promise/);
+  assert.match(lines[12], /got a promise/);
+  assert.match(lines[13], /got a promise/);
+  assert.match(lines[14], /got a promise/);
+  assert.match(lines[15], /threw: an unprintable value/);
 });
 
 test('a health server survives errors after it is listening', { timeout: 30_000 }, () => {
