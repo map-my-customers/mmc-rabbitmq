@@ -1569,6 +1569,11 @@ test('a health() that throws or has no boolean ready answers 503 and logs once',
       () => new Lazy((_, reject) => reject(new Error('lazy'))),
       () => { const p = Promise.reject(new Error('own catch')); p.catch = () => { thenCalls += 1; }; return p; },
       () => { throw new Proxy(new Error('x'), { get() { throw new Error('trap'); } }); },
+      () => { const p = Promise.reject(new Error('own then')); p.then = undefined; return p; },
+      () => {
+        const p = Promise.reject(new Error('ready getter'));
+        return Object.defineProperty(p, 'ready', { get() { throw new Error('ready read'); } });
+      },
     ];
     let thenCalls = 0;
     for (const health of shapes) {
@@ -1581,10 +1586,10 @@ test('a health() that throws or has no boolean ready answers 503 and logs once',
   `);
   assert.equal(result.status, 0, String(result.stderr));
   // /readyz answers 503 on every probe while /livez stays 200, and no then() or catch() of the value's own is called.
-  assert.deepEqual(String(result.stdout).trim().split('\n'), [...Array(16).fill('503,503,200'), 'then() and catch() calls: 0']);
+  assert.deepEqual(String(result.stdout).trim().split('\n'), [...Array(18).fill('503,503,200'), 'then() and catch() calls: 0']);
   // One line per server, not one per probe.
   const lines = String(result.stderr).split('\n').filter((line) => line.startsWith('mmc-rabbitmq: health()'));
-  assert.equal(lines.length, 16, lines.join('\n'));
+  assert.equal(lines.length, 18, lines.join('\n'));
   assert.match(lines[0], /threw: boom/);
   assert.match(lines[3], /got a promise/);
   assert.match(lines[6], /threw: \[object Object\]/);
@@ -1596,6 +1601,8 @@ test('a health() that throws or has no boolean ready answers 503 and logs once',
   assert.match(lines[13], /got a promise/);
   assert.match(lines[14], /got a promise/);
   assert.match(lines[15], /threw: an unprintable value/);
+  assert.match(lines[16], /got ready of type undefined/);
+  assert.match(lines[17], /threw: ready read/);
 });
 
 test('a health server survives errors after it is listening', { timeout: 30_000 }, () => {
