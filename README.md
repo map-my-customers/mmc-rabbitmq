@@ -26,7 +26,7 @@ Versions are git tags. Pin one, next to amqplib:
 ```json
 "dependencies": {
   "amqplib": "2.2.0",
-  "mmc-rabbitmq": "github:map-my-customers/mmc-rabbitmq#v1.0.0"
+  "mmc-rabbitmq": "github:map-my-customers/mmc-rabbitmq#v1.1.0"
 }
 ```
 
@@ -180,22 +180,34 @@ await createHealthServer(mq);
 ```
 
 ```yaml
-livenessProbe:  { httpGet: { path: /livez, port: 8086 } }
-readinessProbe: { httpGet: { path: /readyz, port: 8086 } }
+livenessProbe:
+  httpGet: { path: /livez, port: 8086 }
+  periodSeconds: 30
+  timeoutSeconds: 5
+  failureThreshold: 5
+readinessProbe:
+  httpGet: { path: /readyz, port: 8086 }
 ```
 
 - `/livez` is always 200 while the event loop answers. Never put broker state in a liveness probe: the library
-  reconnects by itself, and a restart during a broker outage only adds load when the broker returns.
+  reconnects by itself, and a restart during a broker outage only adds load when the broker returns. With
+  Kubernetes' defaults (a 1 s timeout, three failures 10 s apart), a handler that keeps the event loop busy for 21 s
+  can get the container restarted, and one that keeps it busy for 31 s always does; the settings above allow at least
+  two minutes.
 - `/readyz` is 200 when ready, else 503. It goes 503 as soon as `close()` starts. A broker that stops answering without
   closing the connection is noticed by the heartbeat after two to three intervals (2 to 3 minutes at the default 60 s);
-  `/readyz` stays 200 until then.
+  `/readyz` stays 200 until then. A node cut off from its cluster's majority keeps its connections open, so the
+  heartbeat does not notice it either. Only a node that pauses closes them (Mnesia with `pause_minority` or
+  `pause_if_all_down`); Khepri, the default metadata store for new clusters from RabbitMQ 4.2 and the only one from
+  4.3, has no pause mode. A quorum-queue consumer on such a node receives nothing, and `/readyz` stays 200 until the
+  majority returns.
 - Anything else is 404.
 
 The server does not keep the process alive, and `close()` closes it once the client has shut down (the returned
-`close()` can also be called earlier). Use `/readyz` (or `health().ready`) as readiness only for a pod that serves no
-traffic of its own. A pod that also serves HTTP should keep readiness on its own routes, and can report `rabbit.health()`
-on a separate path for monitoring; otherwise a broker outage takes every replica out of its Service, including routes
-that never touch the broker.
+`close()` can also be called earlier); one created after the client has closed is closed at once. Use `/readyz` (or
+`health().ready`) as readiness only for a pod that serves no traffic of its own. A pod that also serves HTTP should keep
+readiness on its own routes, and can report `rabbit.health()` on a separate path for monitoring; otherwise a broker
+outage takes every replica out of its Service, including routes that never touch the broker.
 
 Each server reports one object, and a second server on a port in use rejects with `EADDRINUSE`. A container has one
 readiness probe, so a process with two clients serves one object that combines the clients that consume (a client that

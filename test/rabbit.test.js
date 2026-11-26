@@ -153,19 +153,39 @@ test('RetryLater retries in place and acks once', async (t) => {
 
 test('other handler errors, including non-Error throws, reject the message and the consumer carries on', async (t) => {
   const queue = queueName(t, 'poison');
-  const mq = rabbit(t);
+  const errors = [];
+  const mq = rabbit(t, { log: { ...quiet, error: (line) => errors.push(line) } });
   const dlq = withDeadLetters(t, mq, queue);
   const good = [];
+  const calls = {};
   mq.consume(queue, async (msg) => {
     const body = String(msg.content);
+    calls[body] = (calls[body] ?? 0) + 1;
     if (body === 'bad') throw new Error('bad payload');
     if (body === 'worse') throw undefined; // eslint-disable-line no-throw-literal
+    // String() cannot convert these, and instanceof throws for a revoked Proxy.
+    if (body === 'bare') throw Object.create(null);
+    if (body === 'symbol') {
+      const err = new Error('x');
+      err.message = Symbol('odd');
+      throw err;
+    }
+    if (body === 'revoked') {
+      const { proxy, revoke } = Proxy.revocable({}, {});
+      revoke();
+      throw proxy;
+    }
     good.push(body);
   }, { prefetch: 1 });
   await mq.start();
-  for (const body of ['bad', 'worse', 'good']) await mq.sendToQueue(queue, body);
-  await until(async () => good.length === 1 && (await depth(dlq)) === 2);
+  const bodies = ['bad', 'worse', 'bare', 'symbol', 'revoked', 'good'];
+  for (const body of bodies) await mq.sendToQueue(queue, body);
+  await until(async () => good.length === 1 && (await depth(dlq)) === 5);
   await mq.close(2000);
+  // Each failed message is handled once and rejected, not put back in a loop.
+  assert.deepEqual(calls, Object.fromEntries(bodies.map((body) => [body, 1])));
+  assert.match(errors.join('\n'), /handler failed, rejected .*: Symbol\(odd\)/);
+  assert.match(errors.join('\n'), /handler failed, rejected .*: an unprintable value/);
 });
 
 test('onError: requeue puts a failed message back for another try', async (t) => {
@@ -1521,27 +1541,68 @@ test('a health server for something without a health() method is a TypeError', a
 
 test('a health() that throws or has no boolean ready answers 503 and logs once', { timeout: 30_000 }, () => {
   const result = runChild(`
+    // A promise subclass with its own then() and catch().
+    class Counted extends Promise {
+      then(a, b) { thenCalls += 1; return super.then(a, b); }
+      catch(b) { thenCalls += 1; return super.catch(b); }
+    }
+    // p-lazy's shape: the constructor ignores the executor it is given, and then() or catch() starts the work.
+    class Lazy extends Promise {
+      constructor(executor) { super((resolve) => resolve()); this.executor = executor; }
+      then(a, b) { thenCalls += 1; return new Promise(this.executor).then(a, b); }
+      catch(b) { thenCalls += 1; return new Promise(this.executor).catch(b); }
+    }
     const shapes = [
       () => { throw new Error('boom'); },
       () => undefined,
       () => null,
       async () => ({ live: true, ready: true }),
       () => ({ live: true, ready: 'false' }),
+      async () => { throw new Error('rejected'); },
+      () => { throw Object.create(null); },
+      () => { const err = new Error('x'); err.message = Object.create(null); throw err; },
+      () => { const err = new Error('x'); err.message = Symbol('odd'); throw err; },
+      () => ({ then: () => { thenCalls += 1; }, catch: () => { thenCalls += 1; } }),
+      () => { const { proxy, revoke } = Proxy.revocable({}, {}); revoke(); throw proxy; },
+      () => require('node:vm').runInNewContext('Promise.reject(new Error("from another realm"))'),
+      () => Counted.reject(new Error('subclass')),
+      () => new Lazy((_, reject) => reject(new Error('lazy'))),
+      () => { const p = Promise.reject(new Error('own catch')); p.catch = () => { thenCalls += 1; }; return p; },
+      () => { throw new Proxy(new Error('x'), { get() { throw new Error('trap'); } }); },
+      () => { const p = Promise.reject(new Error('own then')); p.then = undefined; return p; },
+      () => {
+        const p = Promise.reject(new Error('ready getter'));
+        return Object.defineProperty(p, 'ready', { get() { throw new Error('ready read'); } });
+      },
     ];
+    let thenCalls = 0;
     for (const health of shapes) {
       const server = await createHealthServer({ health }, { port: 0, host: '127.0.0.1' });
       const get = async (path) => (await fetch('http://127.0.0.1:' + server.port + path)).status;
       console.log([await get('/readyz'), await get('/readyz'), await get('/livez')].join(','));
       await server.close();
     }
+    console.log('then() and catch() calls: ' + thenCalls);
   `);
   assert.equal(result.status, 0, String(result.stderr));
-  assert.deepEqual(String(result.stdout).trim().split('\n'), Array(5).fill('503,503,200'));
+  // /readyz answers 503 on every probe while /livez stays 200, and no then() or catch() of the value's own is called.
+  assert.deepEqual(String(result.stdout).trim().split('\n'), [...Array(18).fill('503,503,200'), 'then() and catch() calls: 0']);
   // One line per server, not one per probe.
   const lines = String(result.stderr).split('\n').filter((line) => line.startsWith('mmc-rabbitmq: health()'));
-  assert.equal(lines.length, 5, lines.join('\n'));
+  assert.equal(lines.length, 18, lines.join('\n'));
   assert.match(lines[0], /threw: boom/);
   assert.match(lines[3], /got a promise/);
+  assert.match(lines[6], /threw: \[object Object\]/);
+  assert.match(lines[7], /threw: \[object Error\]/);
+  assert.match(lines[8], /threw: Symbol\(odd\)/);
+  assert.match(lines[10], /threw: an unprintable value/);
+  assert.match(lines[11], /got a promise/);
+  assert.match(lines[12], /got a promise/);
+  assert.match(lines[13], /got a promise/);
+  assert.match(lines[14], /got a promise/);
+  assert.match(lines[15], /threw: an unprintable value/);
+  assert.match(lines[16], /got ready of type undefined/);
+  assert.match(lines[17], /threw: ready read/);
 });
 
 test('a health server survives errors after it is listening', { timeout: 30_000 }, () => {
@@ -1581,6 +1642,40 @@ test('without a broker: close() does not wait for a health check connection that
   clearTimeout(timer);
   sock.destroy();
   assert.equal(outcome, 'closed');
+});
+
+test('without a broker: a health server made after close() has finished is closed at once', async (t) => {
+  const mq = noBroker(t);
+  await mq.close(200);
+  const health = await createHealthServer(mq, { port: 0, host: '127.0.0.1' });
+  t.after(() => health.close());
+  await assert.rejects(status(health, '/livez'));
+});
+
+test('without a broker: a server made while close() is closing another is closed too', { timeout: 30_000 }, () => {
+  const result = runChild(`
+    const http = require('node:http');
+    const close = http.Server.prototype.close;
+    // Hold every server's close callback, so the second server is made while close() is still closing the first.
+    let release;
+    const held = new Promise((resolve) => (release = resolve));
+    let closingFirst = false;
+    http.Server.prototype.close = function (cb) {
+      closingFirst = true;
+      return close.call(this, (...args) => held.then(() => cb?.(...args)));
+    };
+    const mq = createRabbit({ url: process.argv[2], name: 'close-race', log: { info() {}, warn() {}, error() {} } });
+    await createHealthServer(mq, { port: 0, host: '127.0.0.1' });
+    const closed = mq.close(200);
+    while (!closingFirst) await new Promise((resolve) => setImmediate(resolve));
+    const second = await createHealthServer(mq, { port: 0, host: '127.0.0.1' });
+    const open = await fetch('http://127.0.0.1:' + second.port + '/livez').then(() => true, () => false);
+    release();
+    await closed;
+    console.log('second server open: ' + open);
+  `);
+  assert.equal(result.status, 0, String(result.stderr));
+  assert.equal(String(result.stdout).trim(), 'second server open: false');
 });
 
 test('without a broker: close() closes the health server', async (t) => {

@@ -2,6 +2,7 @@
 
 const { randomUUID } = require('node:crypto');
 const http = require('node:http');
+const { types } = require('node:util');
 const amqp = require('amqplib');
 
 class RetryLater extends Error {
@@ -27,10 +28,31 @@ const ON_ERROR = {
   requeue: 'requeued',
 };
 
-// Per client, what to run once close() has finished: how a health server made for it shuts down with it.
+// Per client, what to run once close() has finished (how a health server made for it shuts down with it), and whether
+// it has finished.
 const closeHooks = new WeakMap();
 
-const describe = (err) => (err instanceof Error ? err.message || err.code || err.name : String(err));
+const describe = (err) => {
+  // Describing an error must not raise another. An Error's message need not be a string, and String() throws for a
+  // value without a usable toString() (a null-prototype object); Object.prototype.toString throws for a revoked Proxy.
+  try {
+    return String(err instanceof Error ? err.message || err.code || err.name : err);
+  } catch {
+    try {
+      return Object.prototype.toString.call(err);
+    } catch {
+      return 'an unprintable value';
+    }
+  }
+};
+// instanceof reads the value's prototype, which a revoked Proxy refuses, so it can throw too.
+const isRetryLater = (err) => {
+  try {
+    return err instanceof RetryLater;
+  } catch {
+    return false;
+  }
+};
 const quietClose = (ch) => Promise.resolve().then(() => ch.close()).catch(() => {});
 const isTimeout = (ms) => typeof ms === 'number' && ms > 0 && ms <= MAX_TIMEOUT;
 const isLimit = (value) => typeof value === 'number' && value > 0;
@@ -98,7 +120,7 @@ function createRabbit({
   const readyWaiters = new Set();
   const idleWaiters = [];
   const closedChannels = new WeakSet();
-  const onClosed = new Set();
+  const afterClose = { hooks: new Set(), done: false };
   let pub = null;
   let sub = null;
   let pubCh = null;
@@ -570,11 +592,12 @@ function createRabbit({
           await handler(msg, { signal });
           return settle(ch, msg, 'ack');
         } catch (err) {
+          const retryLater = isRetryLater(err);
           // Includes the RetryLater that close() gives publishes it could not send: the handler did nothing wrong.
-          if (err instanceof RetryLater && gone()) return settle(ch, msg, 'requeue');
+          if (retryLater && gone()) return settle(ch, msg, 'requeue');
           const exhausted = attempt >= retryLimit.attempts || Date.now() - firstTry + delay > retryLimit.ms;
-          if (!(err instanceof RetryLater) || exhausted) {
-            const retried = err instanceof RetryLater ? ` after ${attempt} attempts` : '';
+          if (!retryLater || exhausted) {
+            const retried = retryLater ? ` after ${attempt} attempts` : '';
             log.error(`mmc-rabbitmq: ${queue} handler failed${retried}, ${ON_ERROR[onError]}: ${describe(err)}`);
             return settle(ch, msg, onError);
           }
@@ -623,7 +646,10 @@ function createRabbit({
   function close(graceMs = 25_000) {
     // setTimeout turns NaN or Infinity into 1 ms, which would skip the drain.
     if (!(typeof graceMs === 'number' && graceMs >= 0)) graceMs = 25_000;
-    closing ??= shutdown(Math.min(graceMs, MAX_TIMEOUT)).finally(() => Promise.all([...onClosed].map((fn) => fn())));
+    closing ??= shutdown(Math.min(graceMs, MAX_TIMEOUT)).finally(() => {
+      afterClose.done = true;
+      return Promise.all([...afterClose.hooks].map((fn) => fn()));
+    });
     return closing;
   }
 
@@ -745,12 +771,12 @@ function createRabbit({
       });
     },
   };
-  closeHooks.set(rabbit, onClosed);
+  closeHooks.set(rabbit, afterClose);
   return rabbit;
 }
 
 async function createHealthServer(rabbit, { port = 8086, host } = {}) {
-  // Otherwise the first /readyz throws inside the request handler and takes the process down.
+  // Fail at startup: without health() the server could only answer 503.
   if (typeof rabbit?.health !== 'function') {
     throw new TypeError('mmc-rabbitmq: createHealthServer needs a client, or an object with a health() method');
   }
@@ -764,10 +790,23 @@ async function createHealthServer(rabbit, { port = 8086, host } = {}) {
     let problem;
     try {
       const health = rabbit.health();
+      // Nothing awaits a promise from health(), so a rejection would be unhandled and take the process down. A native
+      // promise, from any realm, gets a handler before anything reads its properties, and through
+      // Promise.prototype.then: its own then() or catch(), as on a lazy promise subclass or a query builder, can start
+      // work on every probe. That then() builds its result with the subclass's constructor; when that refuses (p-lazy's
+      // does), no handler is attached, and a rejection from such a promise stays unhandled.
+      if (types.isPromise(health)) {
+        try {
+          Promise.prototype.then.call(health, undefined, () => {});
+        } catch {}
+      }
       if (typeof health?.ready === 'boolean') return health.ready;
       let got = `ready of type ${typeof health?.ready}`;
-      if (health == null) got = String(health);
-      else if (typeof health.then === 'function') got = 'a promise';
+      if (health == null) {
+        got = String(health);
+      } else if (typeof health.then === 'function') {
+        got = 'a promise';
+      }
       problem = `must return { ready: boolean }, got ${got}`;
     } catch (err) {
       problem = `threw: ${describe(err)}`;
@@ -791,15 +830,20 @@ async function createHealthServer(rabbit, { port = 8086, host } = {}) {
   // listener takes the process down.
   server.on('error', (err) => console.error(`mmc-rabbitmq: health server error: ${describe(err)}`));
   server.unref();
+  // Read before a close below: a closed server has no address.
+  const { port: bound } = server.address();
+  const afterClose = closeHooks.get(rabbit);
   let closed;
   const close = () =>
     (closed ??= new Promise((resolve) => {
-      closeHooks.get(rabbit)?.delete(close);
+      afterClose?.hooks.delete(close);
       server.close(() => resolve());
       server.closeAllConnections();
     }));
-  closeHooks.get(rabbit)?.add(close);
-  return { port: server.address().port, close };
+  // A client that has already closed runs its hooks no more, so close this server now.
+  if (afterClose?.done) close();
+  else afterClose?.hooks.add(close);
+  return { port: bound, close };
 }
 
 module.exports = { createRabbit, createHealthServer, RetryLater };
